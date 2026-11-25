@@ -29,6 +29,8 @@ reads the read buffer at that index and stores to its own destination:
 - case H is case J's shape with a nested if inside the skipped block (s_and_saveexec, restored with s_or of the
   saved mask): lanes tid.x < 3 store two words, lanes 3-5 one word, the rest none.
 - case G reads two independently offset LDS dwords with the address in the first destination VGPR.
+- cases L-uint and L-unorm use the same formatted load with native descriptor stride and word 3 supplied by the
+  harness. The descriptor selects unaligned UINT16 pairs or an UNORM8 field and permutes the outputs.
 
 The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet). The root signature is the runner's:
 root SRV t0 (read buffer), root UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's
@@ -331,6 +333,28 @@ WORDS_G = bytes.fromhex(
     '06038abe80038bbe05030cf4000000fa7fc08cbf0783148f14000a3a9f0a0a36820a0a3482000834100034d804050000'
     '7fc08cbf00008abfff080c367c0000000524dcd8060000067fc08cbf0786158f1500124a83121234001074e009060480000081bf')
 
+SOURCE_L = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v1, 1
+buffer_load_format_xyzw v[5:8], v[0:1], s[12:15], 0 idxen offen offset:2
+s_waitcnt vmcnt(0)
+v_lshlrev_b32 v4, 4, v0
+buffer_store_dwordx4 v[5:8], v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_L = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '8102027e' '02300ce000050380'
+    '703f8cbf' '84000834' '001078e004050480' '000081bf')
+LOAD_L = bytes.fromhex('02300ce000050380')
+L_STRIDE = 6
+L_WORD3 = {
+    'L-uint': (27 << 12) | 5 | (4 << 3) | (1 << 6),  # Y, X, one, zero
+    'L-unorm': (1 << 12) | 1 | (4 << 3) | (7 << 6) | (5 << 9),  # one, X, W, Y
+}
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -344,6 +368,7 @@ CASES = {
     'H': (SOURCE_H, WORDS_H, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'K': (SOURCE_K, WORDS_K, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
+    **{name: (SOURCE_L, WORDS_L, USER7, (16, 1, 1), (1, 1, 1)) for name in L_WORD3},
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -439,11 +464,33 @@ def input_word(i):
     return (0x8b02a7f1 + i * 0x413b1) & MASK  # tests/compute_check.cpp fills the read buffer this way
 
 
+def formatted_input():
+    # Every selected R8_UNORM field is an exact endpoint, while the UINT16 halves
+    # are all distinct and the neighbouring bytes are nonzero.
+    data = bytearray(b'\x7b' * (WORDS * 4))
+    for lane in range(16):
+        at = 6 * lane + 3
+        data[at:at + 4] = bytes([255 * (lane % 2), 31 + lane, 62 + lane, 96 + lane])
+    return data
+
+
 def expected(name):
     if name == 'I':
         return expected('A')
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
+    if name in L_WORD3:
+        data = formatted_input()
+        for lane in range(16):
+            at = 6 * lane + 3
+            if name == 'L-uint':
+                low, high = struct.unpack_from('<HH', data, at)
+                result = (high, low, 1, 0)
+            else:
+                one = 0x3f800000
+                result = (one, one if data[at] == 255 else 0, one, 0)
+            out[4 * lane:4 * lane + 4] = result
+        return out
     producer_offsets = {'G': (1, 32), 'G-offset0-only': (31, 0), 'G-offset1-only': (0, 31)}
     if name in producer_offsets:
         # The original fill begins at dword 4, the single-field variants at dword 0.
@@ -680,6 +727,76 @@ def check_lds():
     assert 'groupshared' not in translate('A', rsrc2=CASES['A'][2] | 1 << 15).hlsl_cs()
 
 
+def check_formatted_loads():
+    manifest = translate('L-uint').manifest()
+    assert manifest.endswith('udsrc 2 stride 0\nudsrc 3 descword3 0\nsrv 0 buf table 1 0\nuav 0 table 1 16\n'), manifest
+    prefix = WORDS_L[:WORDS_L.index(LOAD_L)]
+    end = bytes.fromhex('000081bf')
+    for width in range(1, 5):
+        load = LOAD_L[:2] + bytes([4 * (width - 1)]) + LOAD_L[3:]
+        hlsl = translate('L-uint', code=prefix + load + end).hlsl_cs()
+        assert 'a = v0 * ud2 + v1 + 2;' in hlsl
+        assert hlsl.count(' = ((ud3 >> ') == width
+    # Word 3 is overwritten in an otherwise intact native descriptor.
+    refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe') + LOAD_L + end))
+    # At a branch target, there is no local descriptor load to prove.
+    refused('local table load', lambda: translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end))
+    local_load = bytes.fromhex('000082bf') + prefix + LOAD_L + end
+    assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=local_load).hlsl_cs()
+    check_formatted_pointer_copy()
+
+
+def check_formatted_pointer_copy():
+    """The descriptor load sits past the entry block and its pointer is a copy of the table pointer made in a
+    block above it. The copy must be the last write to the pointer on every path to the load."""
+    copy, high, load = (bytes.fromhex(h) for h in ('06038abe', '80038bbe', '05030cf4000000fa'))
+    assert WORDS_L.startswith(copy + high + load)
+    tail = WORDS_L[16:WORDS_L.index(LOAD_L)] + LOAD_L + bytes.fromhex('000081bf')
+    target = bytes.fromhex('000082bf')    # s_branch to the next instruction, which becomes a branch target
+    skip_one = bytes.fromhex('010084bf')  # s_cbranch_scc0 over one instruction
+    again = copy                          # s_mov_b32 s10, s6: a second write of the same pointer value
+    same_source = bytes.fromhex('060386be')  # s_mov_b32 s6, s6: a write to the copied register
+
+    def proof(code):
+        """The copy proof for the first table load of this program, without the rest of the translation."""
+        stage = G.Stage.__new__(G.Stage)
+        stage.ins, stage.calculated_pc = list(G.decode(code)), {}
+        at = next(i for i, ins in enumerate(stage.ins) if ins[2] == 's_load_dwordx8')
+        return stage.formatted_pointer_copy(10, at)
+
+    switch = 'switch ((ud3 >> 12) & 127u)'
+    # Copy in the entry block, load and formatted read in the next block.
+    assert proof(copy + high + target + load + tail) == (6, 0)
+    assert switch in translate('L-uint', code=copy + high + target + load + tail).hlsl_cs()
+    # Copy in a later block that every path to the load runs through.
+    assert proof(target + copy + high + target + load + tail) == (6, 1)
+    assert switch in translate('L-uint', code=target + copy + high + target + load + tail).hlsl_cs()
+    # A branch skips the copy: the entry value of s10 reaches the load.
+    assert proof(skip_one + copy + load + tail) is None
+    assert proof(load + tail) is None
+    refused('joined at a branch target', lambda: translate('L-uint', code=skip_one + copy + load + tail))
+    # One arm writes the pointer again. The value is the same, so only this proof can refuse it.
+    assert proof(copy + high + skip_one + again + load + tail) is None
+    refused('local table load', lambda: translate('L-uint', code=copy + high + skip_one + again + load + tail))
+    # A back edge from below the formatted read writes the pointer and re-enters at the load.
+    loop = copy + high + target + load + tail[:-4] + again + bytes.fromhex('f8ff84bf') + tail[-4:]
+    assert [ins[2] for ins in G.decode(loop)][-2:] == ['s_cbranch_scc0', 's_endpgm']
+    assert proof(loop) is None
+    refused('local table load', lambda: translate('L-uint', code=loop))
+    # One path writes descriptor word 3 between the table load and the formatted read.
+    word_write = (copy + high + target + load + WORDS_L[16:WORDS_L.index(LOAD_L)] + skip_one +
+                  bytes.fromhex('0f038fbe') + LOAD_L + bytes.fromhex('000081bf'))  # s_mov_b32 s15, s15
+    refused('local table load', lambda: translate('L-uint', code=word_write))
+    # The only writer is not a register copy.
+    assert proof(bytes.fromhex('80038abe') + high + target + load + tail) is None
+    # The copied register is written on one path into the block that copies it.
+    one_path = skip_one + same_source + copy + high + target + load + tail
+    assert proof(one_path) == (6, 2)
+    refused('local table load', lambda: translate('L-uint', code=one_path))
+    # The same program without that write translates.
+    assert switch in translate('L-uint', code=skip_one + bytes.fromhex('000080bf') + copy + high + target + load + tail).hlsl_cs()
+
+
 def check_controls():
     ff1 = bytes.fromhex('7e1385be')
     end = bytes.fromhex('000081bf')
@@ -694,6 +811,7 @@ def check_controls():
     check_lds()
     check_descriptor_scc()
     check_mbcnt()
+    check_formatted_loads()
     a = translate('A')
     # This buffer-only compute program has no typed UAV declaration or image manifest entry.
     assert a.uavs and a.stored_images() == {}, (a.uavs, a.stored_images())
@@ -867,6 +985,71 @@ def check_controls():
     refused('s_mov_b32 inside a block s_cbranch_execz skips per lane: exec write', lambda: translate(
         'A', code=splice('s_getpc_b64 s[22:23]', 's_add_u32 s22, s22, 20', 's_addc_u32 s23, s23, 0',
                          's_setpc_b64 s[22:23]', *block)).hlsl_cs())
+    # The compiler's i1-phi lane mask: M is zeroed before the branch, set from exec in the block, and read per lane
+    # after the join. For a lane the model skips, the wave's M bit is 0 either way (exec only narrows in the block),
+    # which is the model's M. Accepted for vcc_lo and for an sN, with a move or an s_and in either operand order.
+    SPLICE.update({'s_mov_b32 vcc_lo, 0': '8003eabe', 's_mov_b32 vcc_lo, -1': 'c103eabe', 's_mov_b32 s20, 0': '800394be',
+                   's_mov_b32 s20, -1': 'c10394be', 's_mov_b32 s20, exec_lo': '7e0394be', 's_mov_b32 vcc_lo, s7': '0703eabe',
+                   's_mov_b32 s20, s7': '070394be', 's_mov_b32 vcc_lo, exec_lo': '7e03eabe',
+                   's_and_b32 vcc_lo, s7, exec_lo': '077e6a87', 's_and_b32 s20, exec_lo, s7': '7e071487',
+                   's_and_b32 s20, s7, exec_lo': '077e1487', 's_mov_b64 vcc, exec': '7e04eabe', 'v_cndmask_b32 v5, v5, v6, vcc_lo': '050d0a02',
+                   'v_cndmask_b32 v5, v5, v6, s20': '050001d5050d5200', 's_cbranch_vccz 1': '010086bf',
+                   's_cmp_eq_u32 s20, 0': '148006bf', 's_and_b32 s20, vcc_lo, exec_lo': '6a7e1487', 's_mov_b32 s20, vcc_lo': '6a0394be', 's_mov_b32 s7, s20': '140387be',
+                   's_branch 1': '010082bf', 's_cbranch_scc1 1': '010085bf', 's_cbranch_scc1 0': '000085bf',
+                   's_cbranch_scc1 2': '020085bf', 's_and_b32 vcc_lo, s7, s7': '07076a87',
+                   'v_cndmask_b32 v5, vcc_lo, v6, vcc_lo': '050001d56a0caa01'})
+    def phi(zero, write, read, between=(), inside=()):
+        return splice(*enter, *zero, *between, 's_cbranch_execz %d' % (len(write) + len(inside)), *write, *inside,
+                      *leave, *read)
+    phi_text = lambda code: translate('A', code=code).hlsl_cs()
+    cnd_vcc, cnd_s = ['v_cndmask_b32 v5, v5, v6, vcc_lo'], ['v_cndmask_b32 v5, v5, v6, s20']
+    for zero, write, read in ((['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], cnd_vcc),
+                              (['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo'], cnd_s),
+                              (['s_mov_b32 vcc_lo, 0'], ['s_and_b32 vcc_lo, s7, exec_lo'], cnd_vcc),
+                              (['s_mov_b32 s20, 0'], ['s_and_b32 s20, s7, exec_lo'], cnd_s),
+                              (['s_mov_b32 s20, 0'], ['s_and_b32 s20, exec_lo, s7'], cnd_s)):
+        text = phi_text(phi(zero, write, read))
+        # the lane select reads the mask's lane bit, which the block set from exec (the model runs the block for
+        # every lane it models, and skips it only where exec is clear, leaving the zeroing)
+        assert '& 1) ? ' in text and ('vcc = (exec) & 1;' in text or 's20 = ' in text), text
+    # s_and with exec reads the lane bit only (the result is a lane mask): accepted
+    phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_b32 s20, vcc_lo, exec_lo'] + cnd_vcc))
+    # so does s_and_saveexec with the mask as its source (exec &= the lane bit); with the mask as its destination
+    # the saved exec overwrites it, a whole-mask value, and the later lane select is refused
+    SPLICE.update({'s_and_saveexec_b32 s22, vcc_lo': '6a3c96be', 's_and_saveexec_b32 vcc_lo, vcc_lo': '6a3ceabe'})
+    phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_saveexec_b32 s22, vcc_lo'] + cnd_vcc))
+    refused('definition of vcc, live where the block joins', lambda: phi_text(phi(
+        ['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_saveexec_b32 vcc_lo, vcc_lo'] + cnd_vcc)))
+    # Negative controls: each condition removed keeps the refusal of the live definition.
+    live = lambda name: 'definition of %s, live where the block joins' % name
+    wr, rd = ['s_mov_b32 vcc_lo, exec_lo'], cnd_vcc
+    for zero in (['s_mov_b32 vcc_lo, -1'], [], ['s_mov_b32 vcc_lo, s7']):  # zeroing with all ones, absent, not zero
+        refused(live('vcc'), lambda zero=zero: phi_text(phi(zero, wr, rd)))
+    # a branch target between the zeroing and the branch: the path through the label did not run the zeroing
+    SPLICE['s_cbranch_execz 6'] = '060088bf'
+    refused(live('vcc'), lambda: phi_text(splice(*enter, 's_cbranch_scc1 1', 's_mov_b32 vcc_lo, 0', 's_cbranch_execz 1',
+                                                 *wr, *leave, *rd)))
+    refused(live('vcc'), lambda: phi_text(splice(*enter, 's_mov_b32 vcc_lo, 0', 's_cbranch_scc1 0', 's_cbranch_execz 1',
+                                                 *wr, *leave, *rd)))
+    # no zeroing of s20 at all; a block write that is an s_and without exec; the mask read as a data word
+    refused(live('s20'), lambda: phi_text(phi([], ['s_mov_b32 s20, exec_lo'], cnd_s)))
+    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_and_b32 vcc_lo, s7, s7'], rd)))
+    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, ['v_cndmask_b32 v5, vcc_lo, v6, vcc_lo'])))
+    # a branch between the zeroing and the branch, even one to the join; and a branch inside the block (not straight)
+    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, rd, between=['s_cbranch_scc1 2'])))
+    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, rd, inside=['s_cbranch_scc1 0'])))
+    # a write in the block that is not from exec, or a second write, or a 64-bit write
+    for inside in (['s_mov_b32 vcc_lo, -1'], ['s_mov_b32 vcc_lo, s7']):
+        refused(live('vcc'), lambda inside=inside: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, rd, inside=inside)))
+    # (a vcc_hi write does not translate at all, so the 64-bit move is the wide control)
+    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b64 vcc, exec'], rd)))
+    # whole-mask reads after the join see the other lanes' bits, which the one-lane model lacks: refused
+    for read in (['s_cbranch_vccz 1', 'v_mov_b32 v5, s20'] + cnd_vcc, ['s_mov_b32 s20, vcc_lo'] + cnd_vcc):
+        refused(live('vcc'), lambda read=read: phi_text(phi(['s_mov_b32 vcc_lo, 0'], wr, read)))
+    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo'],
+                                              ['s_cmp_eq_u32 s20, 0'] + cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo'],
+                                              ['s_mov_b32 s7, s20'] + cnd_s)))
     # An implicit-LOD sample has no derivatives in a compute lane; the level-zero form translates.
     load = ('s_mov_b64 s[20:21], 0', 's_mov_b64 s[22:23], 0', 's_load_dwordx8 s[24:31], s[10:11], 0x40')
     sample = 'image_sample v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D'
@@ -920,9 +1103,12 @@ CONTROLS = {
     'g-swapped-offsets': ('G', 'v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];',
                           'v6 = lds[(a + 144u) >> 2];\n    v7 = lds[(a + 20u) >> 2];'),
     'g-overlap': ('G', 'v7 = lds[(a + 144u)', 'v7 = lds[(v6 + 144u)'),
+    'l-byte-offset': ('L-uint', 'a = v0 * ud2 + v1 + 2;', 'a = v0 * ud2 + 2;'),
+    'l-swizzle': ('L-unorm', 'v6 = ((ud3 >> 3)', 'v6 = ((0u >> 3)'),
+    'l-integer-one': ('L-uint', 'c1 = w >> 16; c2 = 0u; c3 = 1u; one = 1u;', 'c1 = w >> 16; c2 = 0u; c3 = 1u;'),
 }
 
-# First bad word for the masked bit-count and paired LDS read controls.
+# First bad word for controls with a pinned mismatch.
 CONTROL_MISMATCH = {
     'd-mask': 'word=8 expected=00000008 actual=00000009',
     'd-whole-mask': 'word=0 expected=00000007 actual=00000011',
@@ -932,6 +1118,9 @@ CONTROL_MISMATCH = {
     'd-exec': 'word=2 expected=ffffffff actual=00000000',
     'g-swapped-offsets': 'word=0 expected=00000004 actual=00000000',
     'g-overlap': 'word=1 expected=00000000 actual=00000004',
+    'l-byte-offset': 'word=0 expected=0000603e actual=00003e1f',
+    'l-swizzle': 'word=5 expected=3f800000 actual=00000000',
+    'l-integer-one': 'word=2 expected=00000001 actual=3f800000',
 }
 
 
@@ -950,8 +1139,12 @@ def run_case(name, dxc, runner, adapter, directory, control=None):
     subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
     groups = CASES[name][4]
     constants = [KEY, STRIDE] + [0] * 14
+    source = b''
+    if name in L_WORD3:
+        constants[2:4] = [L_STRIDE, L_WORD3[name]]
+        source = formatted_input()
     case.write_bytes(struct.pack('<I', groups[0] | groups[1] << 8 | groups[2] << 16)
-                     + struct.pack('<%dI' % WORDS, *expected(name)) + struct.pack('<16I', *constants))
+                     + struct.pack('<%dI' % WORDS, *expected(name)) + struct.pack('<16I', *constants) + source)
     return subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
 
 
@@ -966,6 +1159,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
             runs = [(CONTROLS[control][0], control)]
         else:
             runs = [(name, None) for name in CASES]
+            runs += [(case, mutation) for mutation, (case, _, _) in CONTROLS.items() if case in L_WORD3]
         for name, mutation in runs:
             run = run_case(name, dxc, runner, adapter, Path(tmp), mutation)
             print(run.stdout, end='')
