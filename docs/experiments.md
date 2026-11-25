@@ -3703,6 +3703,13 @@ out-of-range cases. A separate mesh program with one changed compare operand
 adds two controls. Windows WARP with the D3D12 debug layer enabled matched
 all 1,024 pixels for each of the eight cases. Physical hardware and startup
 pipeline integration remain open in [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
+
+Both bounded mesh lowerers also accept `s_bitcmp0_b32`, `s_bitcmp1_b32`,
+`s_bitcmp0_b64` and `s_bitcmp1_b64` (`SCC = (S0[S1[4:0]] == 0/1)` and 6-bit
+`S1[5:0]` for `_b64`), including 32-bit constant-buffer bit tests feeding
+`s_cbranch_scc0` / `s_cbranch_scc1` descriptor joins, while refusing unwritten
+registers, width mismatches, unproven `RuntimeWord`s and descriptor words.
+Reproduce with `mesh_bitcmp_cpu` and `mesh_bitcmp_draw_{warp,hardware}`.
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45485172952)
 
 ### Sampler heap samplers in bounded runtime mesh

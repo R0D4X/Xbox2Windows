@@ -149,6 +149,11 @@ class RuntimeWave(Wave):
         """Handle sampler heap and texture descriptor words; False for any other scalar op."""
         if self.geometry.sampler_heap_sgpr is None:
             return False
+        if op.startswith(("s_cmp_", "s_bitcmp")):
+            found = self.descriptor_operand(args)
+            if found:
+                self.refuse_descriptor_use(op, found)
+            return False
         dest, *sources = args
         if op == "s_load_dwordx8":
             self.load_texture(args)

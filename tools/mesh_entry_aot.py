@@ -392,6 +392,40 @@ class Wave:
                 raise ValueError(f"Unsupported scalar compare {op}")
             self.scc = relation[op]
             return
+        if op in ("s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64"):
+            if len(args) != 2:
+                raise ValueError(f"Expected two operands for {op}")
+            wide = op.endswith("_b64")
+            src0_tok, src1_tok = args
+            # RDNA 2 ISA s9.3 (SOPC): S_BITCMP{0,1}_B{32,64} tests bit S1[4:0] (or S1[5:0]) of S0.
+            if wide:
+                if re.fullmatch(r"s\d+", src0_tok) or src0_tok in ("exec_lo", "exec_hi"):
+                    raise ValueError(f"Expected a 64-bit scalar operand for {op}")
+            elif src0_tok.startswith("s[") or src0_tok in ("exec", "vcc"):
+                raise ValueError(f"Expected a 32-bit scalar operand for {op}")
+            if src1_tok.startswith("s[") or src1_tok in ("exec", "vcc"):
+                raise ValueError(f"Expected a 32-bit bit-index operand for {op}")
+            a, b = self.scalar(src0_tok, True), self.scalar(src1_tok, True)
+            if a is UNDEF or b is UNDEF:
+                self.scc = None
+                return
+            if (
+                not wide
+                and {type(a), type(b)} <= {int, str}
+                and str in (type(a), type(b))
+            ):
+                val = f"asuint({a})" if type(a) is str else f"{a & U32}u"
+                bit = f"(asuint({b}) & 31u)" if type(b) is str else f"{b & 31}u"
+                cmp_op = "==" if op == "s_bitcmp0_b32" else "!="
+                self.scc = Dyn(f"(({val} & (1u << {bit})) {cmp_op} 0u)")
+                return
+            if type(a) is not int or type(b) is not int:
+                raise ValueError("Dynamic scalar predicate")
+            mask = WAVE if wide else U32
+            shift = b & (63 if wide else 31)
+            tested = ((a & mask) >> shift) & 1
+            self.scc = (tested == 0) if op.startswith("s_bitcmp0_") else (tested == 1)
+            return
         if op in SAVEEXEC:
             a = self.scalar(src[0])
             if type(a) is not int:
@@ -706,7 +740,10 @@ class Wave:
         """Execute the wave, yielding at each group barrier."""
         jumps = {offset: i for i, (offset, _) in enumerate(decoded)}
         for _, line in decoded:
-            dest = line.partition(" ")[2].split(", ")[0]
+            op, _, tail = line.partition(" ")
+            if op.startswith(("s_cmp_", "s_bitcmp")):
+                continue
+            dest = tail.split(", ")[0]
             if re.fullmatch(r"s\d+", dest):
                 self.written.add(int(dest[1:]))
             elif dest.startswith("s["):
@@ -758,10 +795,11 @@ class Wave:
                     self.ds_writes_pending = False
                 if "vmcnt" in tail:
                     self.pending_v.clear()
-            elif op == "s_cbranch_scc0" and isinstance(self.scc, Dyn):
+            elif op in ("s_cbranch_scc0", "s_cbranch_scc1") and isinstance(self.scc, Dyn):
+                cond = self.scc if op == "s_cbranch_scc0" else Dyn(f"(!{self.scc.expr})")
                 pc = self.join_arms(
                     decoded, expressions, jumps, pc, offset,
-                    branch_target(offset, tail), self.scc,
+                    branch_target(offset, tail), cond,
                 )
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
