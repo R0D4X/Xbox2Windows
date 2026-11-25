@@ -2633,6 +2633,71 @@ class Stage:
     def op_s_mulk_i32(self, ops, mods):
         return self.scalar_accumulate('s_mulk_i32', ops, mods)
 
+    def scalar_bitset(self, base, ops, mods, set_bit):
+        """s_bitset0_b32 / s_bitset1_b32: D.u[S0.u[4:0]] = 0 / 1, SCC unchanged.
+
+        AMD RDNA 2 ISA section 12.3 (SOP1 opcodes 0x1b and 0x1d; LLVM 15 SOPInstructions.td): D is both
+        read and written, only bits 4:0 of S0 select the bit position, and SCC is left unchanged.
+        """
+        if mods:
+            raise Unsupported('%s with %s' % (base, ' '.join(mods)))
+        if len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('%s destination %s' % (base, ops[0]))
+        d = dst[1]
+        # D is read before it is written: refuse a lane mask or non-numeric symbol before mutating state.
+        if d in getattr(self, 'masks', ()) or self.sym.get(d, ('',))[0] == 'execcopy':
+            raise Unsupported('%s on a lane mask' % base)
+        sym = self.sym.get(d)
+        if sym and (sym[0] not in ('const', 'ud', 'fixed_buffer_word') or (sym[0] == 'const' and len(sym) > 2)):
+            raise Unsupported('%s on %s data' % (base, sym[0]))
+        src_tok = ops[1]
+        if self.is_lane_mask(src_tok):
+            raise Unsupported('%s on a lane mask' % base)
+        src_reg = reg_range(src_tok)
+        if src_reg:
+            if src_reg[0] != 's' or src_reg[1] != src_reg[2] or src_reg[1] > 105:
+                raise Unsupported('%s source %s' % (base, src_tok))
+            if self.sym.get(src_reg[1], ('',))[0] == 'execcopy':
+                raise Unsupported('%s on a lane mask' % base)
+            src_sym = self.sym.get(src_reg[1])
+            if src_sym and (src_sym[0] not in ('const', 'ud', 'fixed_buffer_word')
+                            or (src_sym[0] == 'const' and len(src_sym) > 2)):
+                raise Unsupported('%s on %s data' % (base, src_sym[0]))
+        elif src_tok == 'm0':
+            if self.sym.get('m0'):
+                raise Unsupported('%s on %s data' % (base, self.sym['m0'][0]))
+        else:
+            if src_tok in FLOATS:
+                raise Unsupported('%s source %s' % (base, src_tok))
+            try:
+                val = int(src_tok, 0)
+            except ValueError:
+                raise Unsupported('%s source %s' % (base, src_tok))
+            if not -0x80000000 <= val <= 0xffffffff:
+                raise Unsupported('%s source %s' % (base, src_tok))
+        d_const = sym[1] & 0xffffffff if sym and sym[0] == 'const' else None
+        b_const = self.scalar_const(src_tok)
+        if d_const is not None and b_const is not None:
+            mask = 1 << (b_const & 31)
+            value = (d_const | mask) if set_bit else (d_const & ~mask)
+            value &= 0xffffffff
+            self.set_s(d, '0x%08xu' % value, ('const', value))
+            return None
+        old = self.S(d)
+        bit = self.u(src_tok)
+        expr = '%s | (1u << (%s & 31u))' % (old, bit) if set_bit else '%s & ~(1u << (%s & 31u))' % (old, bit)
+        self.set_s(d, expr)
+        return None
+
+    def op_s_bitset0_b32(self, ops, mods):
+        return self.scalar_bitset('s_bitset0_b32', ops, mods, False)
+
+    def op_s_bitset1_b32(self, ops, mods):
+        return self.scalar_bitset('s_bitset1_b32', ops, mods, True)
+
     def op_s_cselect_b32(self, ops, mods):
         self.scalar_select(ops, False)
 
