@@ -4090,8 +4090,11 @@ class Stage:
             raise Unsupported('%s interpolant %s: expected attrN.x/.y/.z/.w' % (op, ops[2]))
         attr, component = self.note_attr(ops[2], 'f16')
         chan, high = 'xyzw'.index(component), int('high' in mods)
-        vs = getattr(getattr(self, 'pipe', None), 'vs', None)
-        if vs is not None and attr in vs.plain_params and attr not in vs.compr_params:
+        pipe = getattr(self, 'pipe', None)
+        vs = getattr(pipe, 'vs', None)
+        mesh_plain = getattr(pipe, 'mesh_plain_params', None)
+        if (vs is not None and attr in vs.plain_params and attr not in vs.compr_params) or (
+                mesh_plain is not None and attr in mesh_plain):
             self.f16_plain.setdefault(attr, set()).add(chan)
             return attr, 'hparam%d_%s.%s' % (attr, ('lo', 'hi')[high], component), high
         if chan > 1:
@@ -4949,10 +4952,8 @@ class Pipeline:
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
-    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
-                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), pk_u8_s0_contract=False):
-        # pk_u8_s0_contract: the caller guarantees that every v_cvt_pk_u8_f32 S0 register not proven in domain
-        # holds +0.0 or an integer in 1..255 (fixtures only; ordinary translation never selects it).
+    def _init_pixel_context(self, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
+                            ps_attr_map=None, srv_formats=(), pk_u8_s0_contract=False):
         self.pk_u8_s0_contract = pk_u8_s0_contract
         self.root = parse_root(root_blob)
         self.ps_attr_map = ps_attr_map  # stream_interface(): pixel attribute -> (vertex parameter, component mask); None pairs by number
@@ -4983,6 +4984,13 @@ class Pipeline:
         self.notes = set()    # shortcuts taken (written to the manifest as comments)
         self.lod_unvalidated = set()  # image_sample forms read through a heap sampler (LOD fields unchecked, #2221)
         self.modified = set()
+
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
+                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), pk_u8_s0_contract=False):
+        # pk_u8_s0_contract: the caller guarantees that every v_cvt_pk_u8_f32 S0 register not proven in domain
+        # holds +0.0 or an integer in 1..255 (fixtures only; ordinary translation never selects it).
+        self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, vs_fetch,
+                                 ps_attr_map, srv_formats, pk_u8_s0_contract)
         self.rect = self.ud(('rect',))
         if refusals is None:
             self.vs = Stage(self, 'vs', vs_code)
@@ -5380,6 +5388,48 @@ class ComputePipeline(Pipeline):
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         return '\n'.join(lines) + '\n'
+
+
+class MeshPixelStage(Pipeline):
+    """Pixel stage paired with a mesh shader exporting param0..param12 (#2413 T4)."""
+
+    def __init__(self, mesh_params, ps_code, root_blob, *, rtv_formats=(), ps_hw_inputs=None, ps_attr_map=None,
+                 sampler_heap=None, srv_formats=(), refusals=None, decoded=None):
+        from mesh_param_link import MAX_PARAM, validate_linkage
+        self._init_pixel_context(root_blob, sampler_heap, rtv_formats, ps_hw_inputs, None,
+                                 ps_attr_map, srv_formats, False)
+        clean_params = []
+        for p in mesh_params:
+            if type(p) is not int or not 0 <= p <= MAX_PARAM:
+                raise Unsupported('mesh parameter %r outside 0..%d' % (p, MAX_PARAM))
+            clean_params.append(p)
+        self.params = sorted(set(clean_params))
+        self.mesh_plain_params = frozenset(self.params)
+        self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded)
+        self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
+        for a, how in self.ps.attrs.items():
+            if 'f16' not in how:
+                continue
+            if how != {'f16'} or a not in self.params:
+                raise Unsupported('attribute %d is read as binary16 by the pixel stage but not only so, or not '
+                                  'exported as a plain 32-bit parameter by the mesh stage' % a)
+        self.f16_plain = sorted(a for a in self.ps.f16_plain if a in self.params)
+        missing = sorted(a for a in self.ps.attrs if a not in self.params)
+        if missing:
+            raise Unsupported('pixel stage reads attributes %s the mesh stage does not export' % missing)
+        try:
+            validate_linkage(self.params, pixel_attrs=sorted(self.ps.attrs), flat=self.flat,
+                             f16_plain=self.f16_plain, semantic='param')
+        except ValueError as error:
+            raise Unsupported(str(error)) from None
+
+    def common(self):
+        return [line for line in super().common() if self.uds or not line.startswith('cbuffer entry')]
+
+    def linkage(self, *, distance_vectors=0):
+        from mesh_param_link import validate_linkage
+        return validate_linkage(self.params, pixel_attrs=sorted(self.ps.attrs), flat=self.flat,
+                                f16_plain=self.f16_plain, distance_vectors=distance_vectors, semantic='param')
 
 
 def fnv(data, h=1469598103934665603):

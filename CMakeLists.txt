@@ -8180,6 +8180,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/mesh_heap_sampler_check.py")
     add_test(NAME mesh_clip_cull_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_clip_cull_check.py")
+    add_test(NAME mesh_param_link_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/mesh_param_link_check.py")
     add_test(NAME mesh_dynamic_aot_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_dynamic_aot_check.py")
     add_test(NAME mesh_lane_spill_cpu COMMAND "${INTAKE_PYTHON}" -B
@@ -8300,6 +8302,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/mesh_clip_cull_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_clip_cull_draw_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        # Mesh param0..param12 exports paired with gfx2hlsl MeshPixelStage (#2413 T4).
+        add_test(NAME mesh_param_link_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_param_link_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_param_link_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(NAME mesh_entry_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" "${DXC_EXECUTABLE}"
