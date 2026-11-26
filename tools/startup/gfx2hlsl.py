@@ -492,7 +492,7 @@ def check_encoding(code, off, n, name, asm):
         word0, word1 = struct.unpack_from('<2I', code, off)
         if word0 & 0x700 or word1 & 0xe0000000:
             raise Unsupported('%s with neg/abs: not a 16-bit integer source modifier' % name)
-    if name in ('v_sad_u8', 'v_sad_hi_u8', 'v_sad_u16', 'v_sad_u32', 'v_msad_u8', *VOP3_ONLY_VEC_U):
+    if name in ('v_lerp_u8', 'v_sad_u8', 'v_sad_hi_u8', 'v_sad_u16', 'v_sad_u32', 'v_msad_u8', *VOP3_ONLY_VEC_U):
         # VOP3A integer forms take no source abs/neg; refuse those bits here so neg on an inline
         # integer does not print as -N and get accepted as a negative constant.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -4832,6 +4832,10 @@ class Stage:
                 pipe = getattr(self, 'pipe', None)
                 if pipe is not None and isinstance(getattr(pipe, 'uses_sad', None), set):
                     pipe.uses_sad.add(base)
+            elif base == 'v_lerp_u8':
+                pipe = getattr(self, 'pipe', None)
+                if pipe is not None and hasattr(pipe, 'uses_lerp_u8'):
+                    pipe.uses_lerp_u8 = True
             align4 = self.valu_align4(base, ops[1:1 + arity])
             return self.set_v(reg_range(ops[0])[1], text.format(*args), align4=align4)
         if base in SCA:
@@ -9897,6 +9901,7 @@ VEC_U = {
     # Unsigned sums of absolute differences (AMD RDNA 2 ISA reference, VOP3 opcodes 0x15a to 0x15d and 0x171), all
     # modulo 2^32. src1 is the reference: v_msad_u8 leaves out each byte lane whose src1 byte is zero, as in
     # tools/pixel_aot.py.
+    'v_lerp_u8': (3, 'lerp_u8({0}, {1}, {2})'),
     'v_sad_u8': (3, 'sad_u8({0}, {1}, {2})'),
     'v_sad_hi_u8': (3, 'sad_hi_u8({0}, {1}, {2})'),
     'v_sad_u16': (3, 'sad_u16({0}, {1}, {2})'),
@@ -10173,6 +10178,7 @@ class Pipeline:
     uses_gather_2d_lod = False
     uses_store_d16_x = False
     uses_sad = ()
+    uses_lerp_u8 = False
     uses_store_format_xyzw = False
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
@@ -10211,6 +10217,7 @@ class Pipeline:
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
+        self.uses_lerp_u8 = False
         self.uses_store_format_xyzw = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
@@ -10573,6 +10580,14 @@ class Pipeline:
                 '    }',
                 '}',
             ))
+        if self.uses_lerp_u8:
+            # RDNA 2 ISA V_LERP_U8: for each byte lane i, D_i = (S0_i + S1_i + (S2_i & 1)) >> 1.
+            out.append(
+                'uint lerp_u8(uint a, uint b, uint c) {'
+                ' return (((a & 0xffu) + (b & 0xffu) + (c & 1u)) >> 1)'
+                ' | (((((a >> 8) & 0xffu) + ((b >> 8) & 0xffu) + ((c >> 8) & 1u)) >> 1) << 8)'
+                ' | (((((a >> 16) & 0xffu) + ((b >> 16) & 0xffu) + ((c >> 16) & 1u)) >> 1) << 16)'
+                ' | (((((a >> 24) & 0xffu) + ((b >> 24) & 0xffu) + ((c >> 24) & 1u)) >> 1) << 24); }')
         if 'v_sad_u8' in self.uses_sad:
             out.append(
                 'uint sad_u8(uint a, uint b, uint c) {'
@@ -10806,6 +10821,7 @@ class ComputePipeline(Pipeline):
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
+        self.uses_lerp_u8 = False
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
