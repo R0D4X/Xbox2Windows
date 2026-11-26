@@ -149,6 +149,58 @@ void test_culling_scene() {
     require(!is_backface_culled(scene.bounds[3], 0.0f, 0.0f, -2.0f), "meshlet 3 is front-facing");
 }
 
+// Two triangles whose normals are tilted by +/- half_angle around Y, so the cone axis is +Z and
+// min_dot == cos(half_angle). Appends 6 vertices at x offset `x0`.
+std::vector<MeshletVertex> tilted_pair(float half_angle) {
+    const float c = std::cos(half_angle);
+    const float s = std::sin(half_angle);
+    std::vector<MeshletVertex> v;
+    // normal (s,0,c): tangent (c,0,-s) x (0,1,0)
+    v.push_back(make_vertex(0.0f, 0.0f, 0.0f));
+    v.push_back(make_vertex(c, 0.0f, -s));
+    v.push_back(make_vertex(0.0f, 1.0f, 0.0f));
+    // normal (-s,0,c): tangent (c,0,s) x (0,1,0)
+    v.push_back(make_vertex(5.0f, 0.0f, 0.0f));
+    v.push_back(make_vertex(5.0f + c, 0.0f, s));
+    v.push_back(make_vertex(5.0f, 1.0f, 0.0f));
+    return v;
+}
+
+void test_cone_width_threshold() {
+    constexpr float kDeg = 3.14159265f / 180.0f;
+    const std::vector<std::uint32_t> indices{0, 1, 2, 3, 4, 5};
+
+    // Moderate cone (min_dot = cos 60 = 0.5): kept, cutoff = sin(60 deg).
+    const MeshletBufferData moderate = x2w::meshlet::build_meshlets(tilted_pair(60.0f * kDeg), indices);
+    require(moderate.bounds.size() == 1, "moderate cone is one meshlet");
+    require(std::fabs(moderate.bounds[0].cone_cutoff - std::sin(60.0f * kDeg)) < 1e-3f,
+            "moderate cone keeps cutoff = sin(half angle)");
+    require(std::fabs(moderate.bounds[0].cone_axis[2] - 1.0f) < 1e-3f, "moderate cone axis is +Z");
+
+    // Wide cone (min_dot = cos 87 = 0.052, inside (-0.1, 0.1]): too wide to cull, culling disabled.
+    const MeshletBufferData wide = x2w::meshlet::build_meshlets(tilted_pair(87.0f * kDeg), indices);
+    require(wide.bounds.size() == 1, "wide cone is one meshlet");
+    require(wide.bounds[0].cone_cutoff > 1.0f, "cone wider than the threshold disables culling");
+
+    // Just inside the accepted side (min_dot = cos 80 = 0.17 > 0.1): still culls.
+    const MeshletBufferData edge = x2w::meshlet::build_meshlets(tilted_pair(80.0f * kDeg), indices);
+    require(edge.bounds[0].cone_cutoff < 1.0f, "cone just under the threshold still culls");
+}
+
+void test_degenerate_triangle_ignored_for_cone() {
+    // One real +Z triangle plus a sliver (cross product ~1e-8, squared ~1e-16) wound the other way.
+    // The sliver must not enter the cone; otherwise the opposing normals cancel and culling is lost.
+    const float e = 1e-4f;
+    const std::vector<MeshletVertex> verts{
+        make_vertex(0.0f, 0.0f, 0.0f), make_vertex(1.0f, 0.0f, 0.0f), make_vertex(0.0f, 1.0f, 0.0f),
+        make_vertex(5.0f, 0.0f, 0.0f), make_vertex(5.0f, e, 0.0f),     make_vertex(5.0f + e, 0.0f, 0.0f),
+    };
+    const MeshletBufferData data = x2w::meshlet::build_meshlets(verts, {0, 1, 2, 3, 4, 5});
+    require(data.bounds.size() == 1, "sliver case is one meshlet");
+    require(data.bounds[0].cone_cutoff < 0.01f, "sliver triangle is ignored by the cone");
+    require(data.bounds[0].cone_axis[2] > 0.99f, "cone axis follows the real triangle");
+}
+
 void test_negative_controls() {
     const std::vector<MeshletVertex> verts{make_vertex(0, 0, 0), make_vertex(0, 1, 0), make_vertex(1, 0, 0)};
     auto expect_throw = [](auto&& fn, const char* what) {
@@ -174,6 +226,8 @@ int main() {
         test_grid_partitioning();
         test_double_sided_disables_culling();
         test_culling_scene();
+        test_cone_width_threshold();
+        test_degenerate_triangle_ignored_for_cone();
         test_negative_controls();
         std::puts("meshlet_builder_check: PASS");
         return 0;
