@@ -5789,6 +5789,12 @@ class Stage:
     def op_s_bitset1_b32(self, ops, mods):
         return self.scalar_bitset(ops, mods, clear=False)
 
+    def op_s_bitset0_b64(self, ops, mods):
+        return self.scalar_bitset64(ops, mods, clear=True)
+
+    def op_s_bitset1_b64(self, ops, mods):
+        return self.scalar_bitset64(ops, mods, clear=False)
+
     def scalar_bitset(self, ops, mods, clear):
         """s_bitset0/1_b32: clear or set bit S0[4:0] of D in place; SCC unchanged.
 
@@ -5835,6 +5841,74 @@ class Stage:
         else:
             self.set_s(d, result)
         self.masks.discard(d)
+        return None
+
+    def scalar_bitset64(self, ops, mods, clear):
+        """s_bitset0/1_b64: clear or set bit S0[5:0] of 64-bit pair D in place; SCC unchanged.
+
+        RDNA 2 ISA SOP1 0x1c / 0x1e: bit 5 of S0 selects the high vs. low word of D, and
+        S0[4:0] selects the bit within that word. The destination pair is read-modify-write;
+        when S0 aliases the low word of D, the high word is updated first so S0 is read intact.
+        """
+        name = 's_bitset%d_b64' % (0 if clear else 1)
+        if mods or len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2 unmodified' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[1] % 2 != 0 or dst[2] > 105:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        d = dst[1]
+        masks = getattr(self, 'masks', ())
+        mask_high = getattr(self, 'mask_high', ())
+        if self.is_lane_mask(ops[0]) or any(w in masks or w in mask_high for w in (d, d + 1)):
+            raise Unsupported('%s on a lane mask' % name)
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        src_reg = None
+        if ops[1] == 'null':
+            index_imm = 0
+        elif imm:
+            index_imm = int(ops[1], 0) & 63
+        else:
+            src = reg_range(ops[1])
+            if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            src_reg = src[1]
+            if self.is_lane_mask(ops[1]) or src_reg in masks or src_reg in mask_high:
+                raise Unsupported('%s on a lane mask' % name)
+            bit_sym = self.sym.get(src_reg)
+            if bit_sym and bit_sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('%s on %s data' % (name, bit_sym[0]))
+            index_imm = bit_sym[1] & 63 if bit_sym and bit_sym[0] == 'const' else None
+        for r in (d, d + 1):
+            sym = self.sym.get(r)
+            if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('%s on %s data' % (name, sym[0]))
+        if index_imm is not None:
+            target = d + (index_imm >> 5)
+            shift = index_imm & 31
+            sym = self.sym.get(target)
+            if sym and sym[0] == 'const':
+                val = ((sym[1] & ~(1 << shift)) if clear else (sym[1] | (1 << shift))) & 0xffffffff
+                self.set_s(target, '0x%08xu' % val, ('const', val))
+            else:
+                prev = self.S(target)
+                mask = '0x%08xu' % (1 << shift)
+                self.set_s(target, '(%s & ~%s)' % (prev, mask) if clear else '(%s | %s)' % (prev, mask))
+        else:
+            prev_lo, prev_hi = self.S(d), self.S(d + 1)
+            bit = self.u(ops[1])
+            mask = '(1u << (%s & 31u))' % bit
+            upd_lo = '(%s & ~%s)' % (prev_lo, mask) if clear else '(%s | %s)' % (prev_lo, mask)
+            upd_hi = '(%s & ~%s)' % (prev_hi, mask) if clear else '(%s | %s)' % (prev_hi, mask)
+            lo_expr = '((%s & 32u) == 0u ? %s : %s)' % (bit, upd_lo, prev_lo)
+            hi_expr = '((%s & 32u) != 0u ? %s : %s)' % (bit, upd_hi, prev_hi)
+            if src_reg == d:
+                self.set_s(d + 1, hi_expr)
+                self.set_s(d, lo_expr)
+            else:
+                self.set_s(d, lo_expr)
+                self.set_s(d + 1, hi_expr)
+        if hasattr(self, 'masks'):
+            self.masks.difference_update((d, d + 1))
         return None
 
     def scalar_cmov(self, ops, mods, pair, name=None):
