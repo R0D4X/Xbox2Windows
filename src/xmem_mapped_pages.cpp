@@ -17,6 +17,7 @@
 
 #include <iterator>
 #include <limits>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <new>
@@ -35,6 +36,7 @@ struct Backing {
 using Slot = std::pair<std::size_t, ULONG64>;
 struct SlotPin { unsigned references{}; bool retired{}; };
 struct SectionLease {
+    UINT version;
     SIZE_T first_byte;
     SIZE_T length;
     std::vector<Slot> slots;
@@ -229,6 +231,21 @@ Backing* backing_at(ULONG_PTR address)
     if (view == memory.views.end()) return nullptr;
     const auto backing = memory.backings.find(view->second);
     return backing == memory.backings.end() ? nullptr : &backing->second;
+}
+
+bool valid_lease_range(UINT version, ULONG_PTR address, SIZE_T length)
+{
+    if (version == x2w_xmem_section_lease_version) return mirrored_range(address, length);
+    return version == x2w_xmem_single_page_lease_version && length &&
+           length <= page_bytes - (address % page_bytes) && address <= UINTPTR_MAX - (length - 1);
+}
+
+const Backing* lease_backing(UINT version, ULONG_PTR page)
+{
+    if (version == x2w_xmem_section_lease_version || mirrored_range(page, page_bytes))
+        return mirrored_backing(page);
+    const auto* backing = backing_at(page);
+    return backing && backing->committed ? backing : nullptr;
 }
 
 LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
@@ -846,6 +863,13 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
         if (result && !(type & MEM_RESERVE_PLACEHOLDER)) record_reservation(result, bytes);
         how = "placeholder reserve";
     }
+#if X2W_TRACY
+    if (result && (type & MEM_COMMIT)) {
+        // A plot, not a pool: the title releases these ranges with Win32 calls that are not seen here.
+        static std::atomic<long long> committed;
+        X2W_PLOT("XMemVirtualAlloc commits (bytes, cumulative)", static_cast<std::int64_t>(committed += bytes));
+    }
+#endif
     const DWORD error = result ? 0 : GetLastError();
     x2w_local::logf("x2w-xmem XMemVirtualAlloc addr=%p size=0x%llx type=0x%lx attr=0x%llx prot=0x%lx -> %p (%s, err %lu)",
                     address, static_cast<unsigned long long>(bytes), static_cast<unsigned long>(type),
@@ -1370,11 +1394,10 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
 {
     if (!out || bytes != sizeof(*out)) return FALSE;
     *out = {};
-    if (version != x2w_xmem_section_lease_version) return FALSE;
     constexpr SIZE_T max_pages = 64;
     if (length > max_pages * page_bytes) return FALSE;
     const std::lock_guard guard(memory.mutex);
-    if (!memory.next_lease || !mirrored_range(address, length)) return FALSE;
+    if (!memory.next_lease || !valid_lease_range(version, address, length)) return FALSE;
     const auto first = address & ~(page_bytes - 1);
     const auto first_byte = address - first;
     const auto count = (first_byte + length + page_bytes - 1) / page_bytes;
@@ -1386,7 +1409,7 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
         selected.reserve(count);
         for (SIZE_T i = 0; i < count; ++i) {
             const auto page = first + i * page_bytes;
-            const auto* slot = mirrored_backing(page);
+            const auto* slot = lease_backing(version, page);
             if (!slot) return FALSE;
             if (selected.empty())
                 section = slot->section;
@@ -1403,7 +1426,7 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
             ++pinned;
         }
         const auto lease = memory.next_lease;
-        memory.leases.emplace(lease, SectionLease{first_byte, length, selected});
+        memory.leases.emplace(lease, SectionLease{version, first_byte, length, selected});
         ++memory.next_lease;
         *out = {duplicate, lease, selected.front().second, count * page_bytes, first_byte};
         return TRUE;
@@ -1417,11 +1440,11 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
 extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_T byte_offset,
                                               ULONG_PTR address, SIZE_T length)
 {
-    if (version != x2w_xmem_section_lease_version || byte_offset % page_bytes != address % page_bytes)
-        return FALSE;
+    if (byte_offset % page_bytes != address % page_bytes) return FALSE;
     const std::lock_guard guard(memory.mutex);
     const auto found = memory.leases.find(lease);
-    if (found == memory.leases.end() || !mirrored_range(address, length)) return FALSE;
+    if (found == memory.leases.end() || found->second.version != version ||
+        !valid_lease_range(version, address, length)) return FALSE;
     const auto& pin = found->second;
     if (byte_offset < pin.first_byte || byte_offset - pin.first_byte >= pin.length ||
         length > pin.length - (byte_offset - pin.first_byte)) return FALSE;
@@ -1429,7 +1452,7 @@ extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_
     const SIZE_T last_slot = (byte_offset + length - 1) / page_bytes;
     const auto first_page = address & ~(page_bytes - 1);
     for (SIZE_T slot = first_slot; slot <= last_slot; ++slot) {
-        const auto* backing = mirrored_backing(first_page + (slot - first_slot) * page_bytes);
+        const auto* backing = lease_backing(version, first_page + (slot - first_slot) * page_bytes);
         if (!backing || pin.slots[slot] != Slot{backing->slab, backing->offset}) return FALSE;
     }
     return TRUE;
@@ -1437,10 +1460,9 @@ extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_
 
 extern "C" BOOL WINAPI x2w_xmem_release_section(UINT version, ULONG64 lease)
 {
-    if (version != x2w_xmem_section_lease_version) return FALSE;
     const std::lock_guard guard(memory.mutex);
     const auto found = memory.leases.find(lease);
-    if (found == memory.leases.end()) return FALSE;
+    if (found == memory.leases.end() || found->second.version != version) return FALSE;
     for (const auto& slot : found->second.slots) unpin_slot(slot);
     memory.leases.erase(found);
     return TRUE;
