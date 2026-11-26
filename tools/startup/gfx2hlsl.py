@@ -3540,6 +3540,7 @@ class Stage:
             self.uses_pos = False
             self.fetched = False
             self.uniform_v = set()
+            self.has_image_writes = any(op.startswith(('image_store', 'image_atomic')) for _, _, op, _ in self.ins)
             self.varying_s = set()
             self.align4_v = set()
             self.align4_s = set()
@@ -4135,6 +4136,53 @@ class Stage:
             return False
         return True
 
+    def uniform_image_load_dsts(self, base, ops, mods):
+        """Destination VGPRs proven uniform for compute image_load/image_load_mip (#2644 T5)."""
+        if 'd16' in mods:
+            return ()
+        dims = [m[4:] for m in mods if m.startswith('dim:')]
+        dmasks = [m[6:] for m in mods if m.startswith('dmask:')]
+        if len(dims) != 1 or len(dmasks) != 1:
+            return ()
+        dim = dims[0]
+        if dim not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY'):
+            return ()
+        try:
+            dmask = int(dmasks[0], 0)
+        except ValueError:
+            return ()
+        if not 1 <= dmask <= 0xf:
+            return ()
+        packed_2d = base == 'image_load' and dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
+        allowed = ('unorm', 'glc', 'slc', 'dlc') + (('a16',) if packed_2d else ())
+        if any(not m.startswith(('dim:', 'dmask:')) and m not in allowed for m in mods):
+            return ()
+        coords = ops[1]
+        if coords.startswith('['):
+            cs = [c.strip() for c in coords[1:-1].split(',')]
+        else:
+            r = reg_range(coords)
+            if not r or r[0] != 'v':
+                return ()
+            cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        axes = 3 if dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY') else 2
+        expected_addr = 1 if packed_2d else (axes + 1 if base == 'image_load_mip' else axes)
+        if len(cs) != expected_addr or not all(self.uniform_source(c) for c in cs):
+            return ()
+        desc_r = reg_range(ops[2])
+        if not desc_r or desc_r[0] != 's' or desc_r[2] - desc_r[1] != 7:
+            return ()
+        first = self.sym.get(desc_r[1])
+        if (not first or first[0] != 'desc' or first[2] is None or first[1][0] not in ('table', 'root') or
+                any(r in self.varying_s or self.sym.get(r) != desc_word(first, first[3] + i)
+                    for i, r in enumerate(range(desc_r[1], desc_r[2] + 1)))):
+            return ()
+        cand = reg_range(ops[0])
+        count = bin(dmask).count('1')
+        if not cand or cand[0] != 'v' or cand[2] > 255 or cand[2] - cand[1] + 1 != count:
+            return ()
+        return tuple(range(cand[1], cand[2] + 1))
+
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         if (getattr(self, 'vcc_lost', False) or
@@ -4199,6 +4247,15 @@ class Stage:
                 dst, loaded_regs = candidate[1], range(candidate[1], candidate[2] + 1)
             else:
                 loaded = recomputed = False
+        # A compute image_load/image_load_mip at uniform coordinates through a uniform read-only descriptor
+        # reads the same texel in every lane when the stage contains no image writes (#2644 T5).
+        if (dst is None and base in ('image_load', 'image_load_mip') and len(ops) == 3 and
+                self.tracks_uniformity() and getattr(self, 'kind', None) == 'cs' and
+                not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False) and
+                not getattr(self, 'has_image_writes', True)):
+            img_regs = self.uniform_image_load_dsts(base, ops, mods)
+            if img_regs:
+                dst, loaded_regs = img_regs[0], img_regs
         # A shift right of a value built from the X thread id that leaves no thread-id bit.
         shifted = None
         if (dst is None and base == 'v_lshrrev_b32' and not mods and len(ops) == 3 and

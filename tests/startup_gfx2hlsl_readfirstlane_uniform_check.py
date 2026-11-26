@@ -18,9 +18,13 @@ class Pipe:
     """The single resource needed by the buffer-load probe."""
 
     resources = {(('table', 0), 0): {'index': 0}}  # the formatted load reads the stride and FORMAT words by index
+    modified = ()
 
     def resource(self, key, kind):
         return 'r0'
+
+    def uav(self, key, kind):
+        return 'w0'
 
     def ud(self, key):
         return 0
@@ -41,6 +45,8 @@ def run(*instructions, exec_known=True, kind=None, group=None):
         s.pipe.group = group
     s.attrs = {}
     s.sym = {4 + i: ('desc', ('table', 0), 0, i) for i in range(4)}
+    s.sym.update({16 + i: ('desc', ('table', 0), 64, i) for i in range(8)})
+    s.sym.update({32 + i: ('desc', ('table', 0), 128, i) for i in range(8)})
     s.sym[3] = ('fixed_buffer_word',)
     s.used_s, s.used_v, s.masks = set(), set(), set()
     s.exec_known = exec_known
@@ -411,6 +417,50 @@ longest = max(map(len, stage.uniform_expr.values()), default=0)
 check('long doubling chain keeps a bounded recompute expression', longest <= 2 * G.UNIFORM_EXPR_LIMIT, str(longest))
 got = run(MOVE, *[DOUBLE] * 22, READ, kind='cs', group=(64, 1, 1))
 check('entry-block read of a long doubling chain copies the VGPR', isinstance(got, list) and got[-1] == 's9 = v7;', repr(got)[:200])
+
+# Compute image_load / image_load_mip at uniform coordinates through a uniform read-only descriptor (#2644 T5).
+UCOORD2 = ('v_mov_b32_e32 v10, s2', 'v_mov_b32_e32 v11, 0')
+UCOORD3 = UCOORD2 + ('v_mov_b32_e32 v12, 1',)
+for label, instructions, reg in (
+        ('compute 2D image_load uniform coords (lane 0)',
+         UCOORD2 + ('image_load v[12:15], v[10:11], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D',), 12),
+        ('compute 2D image_load uniform coords (lane 3)',
+         UCOORD2 + ('image_load v[12:15], v[10:11], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D',), 15),
+        ('compute 2D image_load partial dmask 0x5',
+         UCOORD2 + ('image_load v[12:13], v[10:11], s[16:23] dmask:0x5 dim:SQ_RSRC_IMG_2D',), 13),
+        ('compute 2D-array image_load uniform coords',
+         UCOORD3 + ('image_load v[14:17], v[10:12], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY',), 14),
+        ('compute 3D image_load uniform coords',
+         UCOORD3 + ('image_load v[14:17], v[10:12], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_3D',), 16),
+        ('compute 2D image_load_mip uniform coords',
+         UCOORD3 + ('image_load_mip v[14:17], v[10:12], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D',), 14),
+        ('compute 2D image_load a16 uniform packed coord',
+         ('v_mov_b32_e32 v10, s2', 'image_load v[12:15], v10, s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D a16'), 12)):
+    got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % reg, kind='cs', group=(64, 1, 1))
+    check(label, isinstance(got, list) and got[-1] == 's9 = v%d;' % reg, repr(got))
+
+for label, instructions, reg, kw in (
+        ('image_load varying x coordinate',
+         ('v_mov_b32_e32 v11, 0', 'image_load v[12:15], [v0, v11], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D'),
+         12, dict(kind='cs', group=(64, 1, 1))),
+        ('image_load_mip varying mip coordinate',
+         UCOORD2 + ('image_load_mip v[14:17], [v10, v11, v0], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D',),
+         14, dict(kind='cs', group=(64, 1, 1))),
+        ('image_load in stage with image_store to another descriptor',
+         UCOORD2 + ('image_load v[12:15], v[10:11], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D',
+                    'image_store v[12:15], v[10:11], s[32:39] dmask:0xf dim:SQ_RSRC_IMG_2D'),
+         12, dict(kind='cs', group=(64, 1, 1))),
+        ('image_load register outside dmask 0x5',
+         UCOORD2 + ('image_load v[12:13], v[10:11], s[16:23] dmask:0x5 dim:SQ_RSRC_IMG_2D',),
+         14, dict(kind='cs', group=(64, 1, 1))),
+        ('image_load with unknown exec',
+         UCOORD2 + ('image_load v[12:15], v[10:11], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D',),
+         12, dict(kind='cs', group=(64, 1, 1), exec_known=False)),
+        ('image_load in pixel stage',
+         UCOORD2 + ('image_load v[12:15], v[10:11], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D',),
+         12, dict(kind='ps'))):
+    got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % reg, **kw)
+    check(f'{label} refused', got == REFUSAL, repr(got))
 
 print('Readfirstlane uniformity checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)

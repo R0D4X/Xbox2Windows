@@ -263,6 +263,79 @@ def filtered(directory, consumer, dxc, env):
           f'program with a clamp sampler reads 0; comparison and heap samplers refused; debug layer: {layer}')
 
 
+def uniform_image_load(directory, consumer, dxc, env):
+    """Compute image_load at uniform coordinates fed into v_readfirstlane_b32 (#2644 T5).
+
+    Reads texel (1, 0) (red 1.0) of the 2x1 texture via image_load, broadcasts it with v_readfirstlane_b32 s20, v12,
+    and XORs s20 into Case A's stored word. Negative control: changing the uniform X coordinate to 0 reads texel (0, 0)
+    (red 0.0), changing all 288 written words.
+    """
+    cache, base = prepare(directory)
+    env = dict(base, **env)
+    (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
+    _, _, rsrc2, group, _ = C.CASES['A']
+    written = 24 * 3 * 2 * 2
+    plain = C.expected('A')
+    one = struct.unpack('<I', struct.pack('<f', 1.0))[0]
+    expected = [word ^ one for word in plain[:written]] + plain[written:]
+    layout = '<%dI' % C.WORDS
+
+    load_ops = (
+        's_load_dwordx8 s[24:31], s[10:11], 0x40',
+        'v_mov_b32_e32 v10, 1',
+        'v_mov_b32_e32 v11, 0',
+        'image_load v[12:15], v[10:11], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D',
+        'v_readfirstlane_b32 s20, v12',
+        'v_xor_b32_e32 v5, s20, v5',
+    )
+    C.SPLICE.update({
+        'v_mov_b32_e32 v10, 1': '8102147e',
+        'v_mov_b32_e32 v10, 0': '8002147e',
+        'v_mov_b32_e32 v11, 0': '8002167e',
+        'image_load v[12:15], v[10:11], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D': '080f00f00a0c0600',
+        'v_readfirstlane_b32 s20, v12': '0c05287e',
+        'v_xor_b32_e32 v5, s20, v5': '140a0a3a',
+    })
+    code = C.splice(*load_ops)
+    pipe = C.translate('A', code=code)
+    assert 's20 = v12;' in pipe.hlsl_cs() and 'v5 = s20 ^ v5;' in pipe.hlsl_cs(), pipe.hlsl_cs()
+    (directory / 'program').write_bytes(code)
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(group, rsrc2))
+
+    got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
+    assert got == [C.SENTINEL] * C.WORDS, 'a Dispatch without a translation wrote the output'
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    translate(cache, dxc, key)
+
+    got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
+    wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
+    assert not wrong, 'word=%d got=%08x expected=%08x (%d words differ)\n%s' % (
+        wrong[0], got[wrong[0]], expected[wrong[0]], len(wrong), result.stderr[-3000:])
+    assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
+    layer = clean(result)
+
+    # Coordinate-mutation control: reading texel (0, 0) (red 0.0) instead of (1, 0) (red 1.0) changes all 288 written words.
+    ctrl_dir = directory / 'ctrl_x0'
+    ctrl_cache, ctrl_base = prepare(ctrl_dir)
+    ctrl_env = dict(env, **ctrl_base)
+    (ctrl_dir / 'compute_root').write_bytes(C.root_blob(table_range=True))
+    ctrl_env['X2W_TEST_COMPUTE_ROOT'] = str(ctrl_dir / 'compute_root')
+    ctrl_ops = (load_ops[0], 'v_mov_b32_e32 v10, 0') + load_ops[2:]
+    (ctrl_dir / 'program').write_bytes(C.splice(*ctrl_ops))
+    (ctrl_dir / 'data').write_bytes(DATA)
+    (ctrl_dir / 'state').write_bytes(state_a(group, rsrc2))
+    _, ctrl_res = run(ctrl_dir, consumer, ctrl_env, 'dispatch-sampled-2x1', layout)
+    ctrl_key = int(lines(ctrl_res, 'x2w-draw compute request')[0].split()[3], 16)
+    translate(ctrl_cache, dxc, ctrl_key)
+    got_ctrl, ctrl_res = run(ctrl_dir, consumer, ctrl_env, 'dispatch-sampled-2x1', layout)
+    assert got_ctrl == plain and sum(a != b for a, b in zip(got_ctrl, expected)) == written, ctrl_res.stderr[-3000:]
+    clean(ctrl_res)
+    print(f'uniform image_load + v_readfirstlane_b32: all {C.WORDS} words match texel (1, 0); texel (0, 0) control differs '
+          f'at {written} words; debug layer: {layer}')
+
+
 def main(consumer, dxc, adapter):
     env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
@@ -271,6 +344,7 @@ def main(consumer, dxc, adapter):
         store(Path(temporary) / 'store', consumer, dxc, env)
         sample(Path(temporary) / 'sample', consumer, dxc, env)
         filtered(Path(temporary) / 'filtered', consumer, dxc, env)
+        uniform_image_load(Path(temporary) / 'uniform_image_load', consumer, dxc, env)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 
