@@ -10089,6 +10089,32 @@ for _bit in (0, 1):
             self.set_scc('((%s >> (%s & 31)) & 1u) == %du' % (self.u(ops[0]), self.u(ops[1]), bit))
         return handler
     setattr(Stage, 'op_s_bitcmp%d_b32' % _bit, _make_bitcmp())
+# s_bitcmp1_b64 / s_bitcmp0_b64: SCC = S0.u64[S1.u[5:0]] == 1 / == 0.
+for _bit in (0, 1):
+    def _make_bitcmp64(bit=_bit, name='s_bitcmp%d_b64' % _bit):
+        def handler(self, ops, mods):
+            if len(ops) != 2 or mods:
+                raise Unsupported('%s requires two unmodified operands' % name)
+            if any(self.is_lane_mask(tok) for tok in ops):
+                raise Unsupported('%s on a lane mask' % name)
+            r0, r1 = reg_range(ops[0]), reg_range(ops[1])
+            masks = getattr(self, 'masks', ())
+            mask_high = getattr(self, 'mask_high', ())
+            if r0:
+                if r0[0] != 's':
+                    raise Unsupported('%s source %s' % (name, ops[0]))
+                if any(w in masks or w in mask_high for w in range(r0[1], r0[2] + 1)):
+                    raise Unsupported('%s on a lane mask' % name)
+            if (r1 and (r1[0] != 's' or r1[1] != r1[2] or r1[1] > 105)) or ops[1] in FLOATS:
+                raise Unsupported('%s bit index %s' % (name, ops[1]))
+            if r1 and r1[1] in mask_high:
+                raise Unsupported('%s on a lane mask' % name)
+            low, high = ('0u', '0u') if ops[0] == 'null' else self.i64_words(ops[0], False, True)
+            idx = self.u(ops[1])
+            word = '((%s & 32u) != 0u ? %s : %s)' % (idx, high, low)
+            self.set_scc('((%s >> (%s & 31u)) & 1u) == %du' % (word, idx, bit))
+        return handler
+    setattr(Stage, 'op_s_bitcmp%d_b64' % _bit, _make_bitcmp64())
 
 
 def scalar_wide_fold(helper, x, amount, signed):
