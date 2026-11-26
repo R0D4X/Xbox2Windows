@@ -186,11 +186,11 @@ def check_dynamic_joins():
     assert "((asuint(pointData[0].x) & (1u << 5u)) == 0u)" in hlsl0, hlsl0
 
     hlsl1 = lower_static(join_program("s_bitcmp1_b32 s14, 5", "s_cbranch_scc1"), [0x1003], (3, 1))
-    assert "(!((asuint(pointData[0].x) & (1u << 5u)) != 0u))" in hlsl1, hlsl1
+    assert "((asuint(pointData[0].x) & (1u << 5u)) != 0u) ? matrixData[0].y : pointData[0].y" in hlsl1, hlsl1
 
     hlsl_dyn = lower_static(join_program("s_bitcmp1_b32 s14, s13", "s_cbranch_scc1", dynamic_bit=True),
                             [0x1003], (3, 1))
-    assert "(!((asuint(pointData[0].x) & (1u << (asuint(pointData[0].z) & 31u))) != 0u))" in hlsl_dyn, hlsl_dyn
+    assert "((asuint(pointData[0].x) & (1u << (asuint(pointData[0].z) & 31u))) != 0u) ? matrixData[0].y : pointData[0].y" in hlsl_dyn, hlsl_dyn
 
 
 def check_refusals():
