@@ -49,9 +49,11 @@
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
+#include "startup_stubs/view_dimension.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/d3d12_teardown.h"
 #include "startup_stubs/rect_indirect_args.h"
+#include "startup_stubs/split_indirect_dispatch.h"
 #include "startup_stubs/profile_zone.h"
 
 #include "startup_stubs/slice_footprints.h"
@@ -173,8 +175,6 @@ struct alignas(16) WrapperOwn {
                             // accesses: a race needs the guest to use a resource across its own final Release.
     bool retire_hold_missed;  // Resource: retire_hold could not record a use (no desktop object or no room), so the
                               // drain must keep it for the process instead of dropping a list's desktop object.
-    bool retire_views_stuck;  // Resource: X2W_D3D12_RELEASE_RETIRED_VIEWS could not clear every descriptor slot that
-                              // names it, so it stays retained (and is not scanned again).
     std::uint8_t retire_never;  // RetireNever of this resource (set only with X2W_D3D12_RELEASE_RETIRED)
     std::uint8_t retire_left;   // RetireLeft: the first use that took it out of the class
     volatile LONG retire_view_refs;  // Live tracked slot-18 SRV descriptor slots referencing this resource.
@@ -187,6 +187,8 @@ struct alignas(16) WrapperOwn {
     LONG compute_trace_dispatches;
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
     ID3D12RootSignature* pipeline_root; // PipelineState: desktop root signature its compute stream declared
+    u64 compute_request_key;           // PipelineState: key of the slot 67 request it published, or 0
+    const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
@@ -824,17 +826,22 @@ const D3D12_CLEAR_VALUE* packed_clear_value(const D3D12_CLEAR_VALUE* clear, DXGI
     return &copy;
 }
 
-bool release_retired_enabled()
+bool legacy_retire_view_stats()
 {
-    static const bool on = x2w_local::env_on("X2W_D3D12_RELEASE_RETIRED");
-    return on;
+    static const bool requested = [] {
+        if (!x2w_local::env_on("X2W_D3D12_RELEASE_RETIRED_VIEWS")) return false;
+        log("x2w-d3d12: X2W_D3D12_RELEASE_RETIRED_VIEWS no longer clears live descriptors; budget statistics only");
+        return true;
+    }();
+    return requested;
 }
 
-// X2W_D3D12_RELEASE_RETIRED_VIEWS=1 (needs X2W_D3D12_RELEASE_RETIRED=1): a released class member that only tracked slot-18
-// descriptor slots keep alive is freed once every such slot has been replaced by a null descriptor.
-bool release_retired_views_enabled()
+bool release_retired_enabled()
 {
-    static const bool on = release_retired_enabled() && x2w_local::env_on("X2W_D3D12_RELEASE_RETIRED_VIEWS");
+    static const bool on = [] {
+        (void)legacy_retire_view_stats();
+        return x2w_local::env_on("X2W_D3D12_RELEASE_RETIRED");
+    }();
     return on;
 }
 
@@ -1517,6 +1524,39 @@ ID3D12Resource* recording_rect_scratch(Wrapper* self)
     }
     ReleaseSRWLockExclusive(&allocator_lock);
     return scratch;
+}
+
+// Keeps `resource` with this recording's desktop allocator, like the rectangle-list scratch above. False if the list
+// is not recording (the caller must not use the resource then).
+bool retain_with_recording(Wrapper* self, x2w_startup::ComPtr<ID3D12Resource> resource)
+{
+    bool retained = false;
+    AcquireSRWLockExclusive(&allocator_lock);
+    const auto& state = self->own();
+    const auto found = list_recordings.find(self);
+    if (state.list_open && found != list_recordings.end() && found->second) {
+        try {
+            found->second->scratches.push_back(std::move(resource));
+            retained = true;
+        } catch (const std::bad_alloc&) {
+        }
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return retained;
+}
+
+// Fixture query: how many scratch buffers the desktop allocator of this list's latest recording still holds (the
+// rectangle-list scratch and the split indirect Dispatch records). They are released only when that allocator is
+// reset after every queue that ran its recordings has passed its fence (allocator_reset).
+extern "C" __declspec(dllexport) UINT x2w_d3d12_recording_scratches(void* guest_list)
+{
+    Wrapper* self = as_wrapper(guest_list);
+    if (!self || self->own().kind != list_kind) return 0;
+    AcquireSRWLockShared(&allocator_lock);
+    const auto found = list_recordings.find(self);
+    const UINT held = found != list_recordings.end() && found->second ? static_cast<UINT>(found->second->scratches.size()) : 0;
+    ReleaseSRWLockShared(&allocator_lock);
+    return held;
 }
 
 // Fixture query for two closed recordings before either is submitted.
@@ -2459,6 +2499,8 @@ struct Pass {
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
     ID3D12RootSignature* compute_pipeline_root = nullptr; // root the bound compute pipeline was built against
     UINT compute_srv_bound = 0;                           // root SRV parameters that reached the desktop list since slot 33
+    // Desktop root UAVs a fixture bound through x2w_d3d12_fixture_compute_root_uav, set again after a shim compute pass.
+    std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_root_uavs{};
     const std::vector<RootParameter>* compute_params = nullptr;
     std::unique_ptr<ComputeBindingTrace> compute_trace;
     bool compute_root_has_arguments = false;     // that root declares parameters other than root SRVs, or static samplers
@@ -2482,6 +2524,7 @@ struct Pass {
     x2w_startup::ViewTable view_tables[16]{};
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
+    x2w_startup::ViewTable title_view_heap;  // slot 32: the title memory of the list's view heap (heap records)
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
@@ -2499,6 +2542,8 @@ struct Pass {
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     ID3D12Resource* trace_targets[8]{};
     ID3D12Resource* trace_depth = nullptr;
+    ID3D12Resource* bound_targets[8]{};  // the last accepted bind: targets [0, target_count) and the depth texture
+    ID3D12Resource* bound_depth = nullptr;
     bool heap_set = false;
     x2w_startup::SamplerSource title_samplers;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
@@ -2679,6 +2724,40 @@ UINT __stdcall list_resource_barriers(Wrapper* self, UINT count, const D3D12_RES
     return 0; // no console barrier actions to perform on the caller's side
 }
 
+// Compute root views on the desktop list. Root SRVs come from slot 43; root UAVs only from the fixture hook
+// x2w_d3d12_fixture_compute_root_uav (slot 45 is not forwarded). Both are recorded here so restore_compute_root can set
+// them again after a shim compute pass has replaced the desktop compute root.
+void bind_compute_root_view(Pass& pass, ID3D12GraphicsCommandList* list, UINT parameter, D3D12_ROOT_PARAMETER_TYPE type,
+                            D3D12_GPU_VIRTUAL_ADDRESS address)
+{
+    if (type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+        pass.desktop_compute_upload_srvs[parameter] = address;
+        list->SetComputeRootShaderResourceView(parameter, address);
+    } else if (type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+        pass.desktop_compute_root_uavs[parameter] = address;
+        list->SetComputeRootUnorderedAccessView(parameter, address);
+    }
+}
+bool has_compute_root_views(const Pass& pass)
+{
+    const auto live = [](D3D12_GPU_VIRTUAL_ADDRESS address) { return address != 0; };
+    return std::any_of(pass.desktop_compute_upload_srvs.begin(), pass.desktop_compute_upload_srvs.end(), live) ||
+        std::any_of(pass.desktop_compute_root_uavs.begin(), pass.desktop_compute_root_uavs.end(), live);
+}
+// Sets the title's desktop compute root again, with every view bind_compute_root_view recorded under it, after a shim
+// compute pass (indexed-draw validation, split indirect Dispatch) replaced the root and invalidated its arguments.
+void restore_compute_root(const Pass& pass, ID3D12GraphicsCommandList* list)
+{
+    if (!pass.desktop_compute_root) return;
+    list->SetComputeRootSignature(pass.desktop_compute_root.Get());
+    for (UINT parameter = 0; parameter < pass.desktop_compute_upload_srvs.size(); ++parameter) {
+        if (const auto address = pass.desktop_compute_upload_srvs[parameter])
+            list->SetComputeRootShaderResourceView(parameter, address);
+        if (const auto address = pass.desktop_compute_root_uavs[parameter])
+            list->SetComputeRootUnorderedAccessView(parameter, address);
+    }
+}
+
 void __stdcall list_compute_root(Wrapper* self, void* root)
 {
     auto* list = recording(self);
@@ -2692,6 +2771,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
     pass.compute_tables.set_signature(w ? root_info(w) : nullptr);  // a different signature leaves no table bound
     pass.compute_params = real ? root_info(w) : nullptr;
+    pass.compute_srv_bound = 0;
+    // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
+    pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (compute_binding_trace_enabled() && (!pass.compute_trace || pass.compute_trace->root != w)) {
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
@@ -2700,11 +2782,33 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
     pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (pass.compute_root) {
-        if (pass.desktop_compute_root.Get() != pass.compute_root)
+        if (pass.desktop_compute_root.Get() != pass.compute_root) {
             pass.desktop_compute_upload_srvs.fill(0);
+            pass.desktop_compute_root_uavs.fill(0);
+        }
         pass.desktop_compute_root = pass.compute_root;
         list->SetComputeRootSignature(pass.compute_root);
     }
+}
+
+// Fixture binding of a desktop root UAV (a desktop GPU address) on a guest list's recording, under the compute root
+// set through slot 33. Not a guest slot: titles have no compute root UAV on the desktop list (slot 45 is not
+// forwarded). It records the view through bind_compute_root_view, as slot 43 does for root SRVs, so
+// restore_compute_root sets it again after a shim compute pass; a binding made on the desktop list directly would be
+// lost there.
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_compute_root_uav(void* guest_list, UINT parameter, UINT64 address)
+{
+    Wrapper* self = as_wrapper(guest_list);
+    if (!self || self->own().kind != list_kind) return FALSE;
+    auto* list = recording(self);
+    auto& pass = pass_of(self);
+    const auto* params = pass.compute_params;
+    if (!list || !pass.compute_root || !params || parameter >= params->size() ||
+        parameter >= pass.desktop_compute_root_uavs.size() || (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_UAV ||
+        !address)
+        return FALSE;
+    bind_compute_root_view(pass, list, parameter, D3D12_ROOT_PARAMETER_TYPE_UAV, address);
+    return TRUE;
 }
 
 // Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
@@ -2882,12 +2986,20 @@ constexpr const char* aliased_index_unaligned = "aliased_index_unaligned";
 constexpr const char* mesh_xmem_read = "mesh_xmem_read";
 constexpr const char* rect_live_compute_root = "rect_live_compute_root";
 constexpr const char* rect_conversion_unavailable = "rect_conversion_unavailable";
+constexpr const char* split_dispatch_unavailable = "split_dispatch_unavailable";
 constexpr const char* count_missing_resource = "count_missing_resource";
 constexpr const char* count_invalid_offset = "count_invalid_offset";
 constexpr const char* count_outside_placed_buffer = "count_outside_placed_buffer";
 constexpr const char* count_not_common_state = "count_not_common_state";
 constexpr const char* unknown = "unknown";
 }  // namespace indirect_other_refusal_code
+
+// Opt-in (X2W_SPLIT_INDIRECT_DISPATCH=1): a batched or counted indirect Dispatch with a desktop compute pipeline is
+// split into single-command calls (split_indirect_dispatch.h). Without it the native call runs on every adapter.
+bool split_indirect_dispatch_enabled()
+{
+    return x2w_local::env_on("X2W_SPLIT_INDIRECT_DISPATCH");
+}
 
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
@@ -2988,6 +3100,17 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 if ((pass.constant_words_bound[i] & mask) != mask)
                     return refuse("cached mesh root constants are incomplete", indirect_graphics_pipeline);
             }
+        } else if (translated) {
+            if (!pass.targets_bound || (!pass.target_count && pass.dsv_format == DXGI_FORMAT_UNKNOWN) ||
+                !pass.viewport_set || !pass.scissor_set) {
+                const char* code =
+                    (!pass.targets_bound || (!pass.target_count && pass.dsv_format == DXGI_FORMAT_UNKNOWN))
+                        ? indirect_other_refusal_code::no_render_target
+                        : indirect_other_refusal_code::missing_viewport_or_scissor;
+                return refuse("translated indirect draw requires bound target or depth view, viewport and scissor", indirect_other, code);
+            }
+            if (!pass.targets_single_sample)
+                return refuse("draw requires single-sample targets", indirect_other, indirect_other_refusal_code::multisample_target);
         } else if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
             (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set) {
@@ -3004,7 +3127,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             return refuse("indirect rectangle list requires a non-indexed draw", indirect_other, indirect_other_refusal_code::rect_list_indexed);
         if (!mesh && !rect_list && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
             return refuse("indirect draw requires triangle-list or rectangle-list topology", indirect_other, indirect_other_refusal_code::unsupported_topology);
-        if (!pass.indirect_graphics.cached_mesh) {
+        if (!pass.indirect_graphics.cached_mesh && !translated) {
             const auto samples = pass.target0->GetDesc().SampleDesc;
             if (samples.Count != 1 || samples.Quality)
                 return refuse("draw requires a single-sample render target", indirect_other, indirect_other_refusal_code::multisample_target);
@@ -3118,8 +3241,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         }
     }
     if (rect_list) {
-        if (std::any_of(pass.desktop_compute_upload_srvs.begin(), pass.desktop_compute_upload_srvs.end(),
-                        [](u64 address) { return address != 0; }))
+        if (has_compute_root_views(pass))
             return refuse("rectangle-list conversion would drop live compute root arguments",
                           indirect_other, indirect_other_refusal_code::rect_live_compute_root);
         // The producer's count names three vertices per rectangle; the desktop draw needs six. Convert on the GPU
@@ -3149,6 +3271,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             }
         }
     }
+    // Opt-in split of a batched or counted Dispatch for adapters that run only its first command
+    // (split_indirect_dispatch.h). Only a rootless Dispatch signature with a desktop compute pipeline and root reaches
+    // here with a count above one or a count buffer; graphics and mesh signatures are refused above.
+    const bool split = command == IndirectCommand::dispatch && pass.compute_pipeline && pass.compute_root &&
+        (count > 1 || count_buffer) && split_indirect_dispatch_enabled();
     ID3D12Resource* counts = nullptr;
     if (count_buffer) {
         // The count word is four bytes in a unique placed buffer that also tracks state from COMMON.
@@ -3165,7 +3292,35 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (!count_info || count_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
             return refuse("count buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::count_not_common_state);
         counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
-        if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        if (counts != resource)
+            require_state(self, counts, split ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    }
+    if (split) {
+        // The rewrite reads the title's records and count word by copies only, then replaces the compute root and
+        // pipeline. The compute state the title can set on the desktop list is the pipeline (slot 25), the root
+        // (slot 33) and root SRVs (slot 43); the other compute root setters are not forwarded. The pipeline is set
+        // again here and the root with its views by restore_compute_root, the same code as after the indexed-draw
+        // validation pass, before the single-command calls.
+        auto* desktop = device_of(self->own().list_device);
+        const auto stride = static_cast<UINT>(sig->own().indirect_bytes);
+        auto rewritten = x2w_startup::SplitIndirectDispatch::make_scratch(desktop, count, stride);
+        if (!rewritten || !retain_with_recording(self, rewritten))
+            return refuse("split indirect Dispatch has no scratch buffer", indirect_other,
+                          indirect_other_refusal_code::split_dispatch_unavailable);
+        require_state(self, resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (!x2w_startup::split_indirect_dispatch().rewrite(list, resource, offset, count, stride, counts, count_offset,
+                                                             rewritten.Get()))
+            return refuse("split indirect Dispatch rewrite is unavailable", indirect_other,
+                          indirect_other_refusal_code::split_dispatch_unavailable);
+        list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
+        restore_compute_root(pass, list);
+        const auto first = x2w_startup::SplitIndirectDispatch::rewritten_offset(count, stride);
+        auto* command = static_cast<ID3D12CommandSignature*>(sig->own().real);
+        for (UINT i = 0; i < count; ++i)
+            list->ExecuteIndirect(command, 1, rewritten.Get(), first + u64{i} * sizeof(D3D12_DISPATCH_ARGUMENTS), nullptr, 0);
+        x2w_startup::SplitIndirectDispatch::finish(list, rewritten.Get());
+        InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
+        return;
     }
     if (!leased_arguments && !rect_list) {
         require_state(self, resource, argument_state);
@@ -3478,6 +3633,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.depth_view_writable = false;
     pass.target_count = 0;
     pass.target0 = nullptr;
+    std::fill_n(pass.bound_targets, 8, nullptr);
+    pass.bound_depth = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
     if (!list) return;
     static LONG refused, unresolved_logged;
@@ -3571,6 +3728,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     }
     if (dsv_target) require_state(self, dsv_target, dsv_state);
     pass.target_count = count;
+    std::copy_n(targets, 8, pass.bound_targets);
+    pass.bound_depth = dsv_target;
     pass.dsv_format = dsv_format;
     const auto single_sample = [](ID3D12Resource* resource) {
         const auto samples = resource->GetDesc().SampleDesc;
@@ -3623,8 +3782,7 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     // A rejected replacement leaves no valid binding: the desktop list may still hold the previous address.
     if (parameter < 32) pass.compute_srv_bound &= ~(1u << parameter);
     if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
-        pass.desktop_compute_upload_srvs[parameter] = gpu;
-        list->SetComputeRootShaderResourceView(parameter, gpu);
+        bind_compute_root_view(pass, list, parameter, D3D12_ROOT_PARAMETER_TYPE_SRV, gpu);
         if (parameter < 32) pass.compute_srv_bound |= 1u << parameter;
     }
 }
@@ -3679,8 +3837,10 @@ void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
     pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
 }
 // List slot 14, Dispatch. Forwarded only with a desktop compute pipeline and root bound and group counts within the limit.
+bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z);
 void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
 {
+    if (dispatch_translated(self, x, y, z)) return;  // a slot 67 placeholder never reaches the desktop decision
     auto* list = recording(self);
     x2w_startup::ListDispatch request;
     request.list_open = list != nullptr;
@@ -3755,6 +3915,7 @@ std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_draw.inl"
+#include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
 #include "startup_stubs/list_copy_texture.inl"
@@ -4214,6 +4375,39 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     return S_OK;
 }
 
+// A null R8G8B8A8_UNORM SRV of a texture dimension (2 to 10; any other value gives texture 2D). A null resource
+// reads no more of the description than its format and dimension.
+D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc(unsigned dimension)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(x2w_view_dimension::refused_srv_null_dimension(dimension));
+    switch (desc.ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D: desc.Texture1D.MipLevels = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: desc.Texture1DArray.MipLevels = 1; desc.Texture1DArray.ArraySize = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: desc.Texture2DArray.MipLevels = 1; desc.Texture2DArray.ArraySize = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: desc.Texture2DMSArray.ArraySize = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D: desc.Texture3D.MipLevels = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: desc.TextureCube.MipLevels = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: desc.TextureCubeArray.MipLevels = 1; desc.TextureCubeArray.NumCubes = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
+    default: desc.Texture2D.MipLevels = 1; break;
+    }
+    return desc;
+}
+
+// X2W_D3D12_VIEW_DEFAULTS (view_dimension.h): which slots give an unknown-dimension view the resource's default view.
+x2w_view_dimension::DefaultViews view_defaults_mode()
+{
+    static const x2w_view_dimension::DefaultViews mode = [] {
+        char value[8]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_D3D12_VIEW_DEFAULTS", value, sizeof(value));
+        return x2w_view_dimension::default_views_mode(n && n < sizeof(value) ? value : nullptr);
+    }();
+    return mode;
+}
+
 // Device view slots: forwarded with the destination CPU handle (argument D, 0-based after the
 // object) translated from title to desktop.
 // Desktop removes the device (DXGI_ERROR_INVALID_CALL) on view calls it rejects, so they are checked
@@ -4224,13 +4418,26 @@ template <int N, int D>
 __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
 {
     Timed timed(time_view);
-    // UAV, RTV and DSV views keep the resource's old lifetime; slot-18 SRVs stay in the retire class as long as
-    // their descriptor slots are tracked by shadow_slot and translated draws hold bound resources with retire_hold.
-    if constexpr (N >= 19 && N <= 21) retire_leave_class(reinterpret_cast<const void*>(a), RetireLeft::view);
-    if constexpr (N == 19) retire_leave_class(reinterpret_cast<const void*>(b), RetireLeft::view);
     u64 args[4] = {unwrap(a), unwrap(b), unwrap(c), unwrap(d)};
     const u64 title_dest = args[D];
     args[D] = desktop_cpu_handle(args[D]);
+    // Slots 18-21 name a resource in a descriptor slot. While shadow_slot() tracks the destination, note_view() owns the
+    // slot's reference: the view (slot 19 for its resource and its counter resource) holds the resource in the retire
+    // class until the slot is overwritten, copied over, or its heap is destroyed. Without a tracked slot the shim cannot
+    // follow the descriptor, so the use takes the resource out of the class for good, as before.
+    if constexpr (N >= 19 && N <= 21) {
+        bool tracked = false;
+        if (args[D]) {
+            AcquireSRWLockShared(&note_lock);
+            tracked = shadow_slot(args[D]) != nullptr;
+            ReleaseSRWLockShared(&note_lock);
+        }
+        if (!tracked) {
+            retire_leave_class(reinterpret_cast<const void*>(a), RetireLeft::view);
+            if constexpr (N == 19) retire_leave_class(reinterpret_cast<const void*>(b), RetireLeft::view);
+        }
+    }
+    // No desktop destination handle: the view stays title-side, where no shadow slot can follow it.
     if (!args[D]) {
         if constexpr (N == 18) retire_leave_class(reinterpret_cast<const void*>(a), RetireLeft::view);
         return 0;
@@ -4243,16 +4450,72 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                   described_bytes, title_dest, args[D], materialized);
     };
     const char* skip = nullptr;
+    bool default_view = false;
+    bool uav_denied = false;  // a UAV of a resource without unordered access: recorded as not created, as before #2649
     if (N == 17) skip = "constant buffer view (title GPU address)";
     if (N >= 18 && N <= 21 && args[0]) {
         const UINT flags = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc().Flags;
         if (N == 18 && (flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) skip = "resource denies shader resource views";
-        if (N == 19 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) skip = "resource lacks unordered access";
+        if (N == 19 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            skip = "resource lacks unordered access";
+            uav_denied = true;
+        }
         if (N == 20 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) skip = "resource lacks render target";
         if (N == 21 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) skip = "resource lacks depth stencil";
+        // Every view description of slots 18-21 starts with Format, then ViewDimension.
+        const u64 described = N == 19 ? args[2] : args[1];
+        UINT view_dimension = 0;
+        if (!skip && described && x2w_local::readable(reinterpret_cast<const void*>(described), 8)) {
+            std::memcpy(&view_dimension, reinterpret_cast<const unsigned char*>(described) + 4, sizeof(view_dimension));
+            const D3D12_RESOURCE_DESC resource_desc = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc();
+            const auto dimension = static_cast<unsigned>(resource_desc.Dimension);
+            if (view_dimension == 0) {
+                // UNKNOWN: desktop refuses it; make the resource's default view where that is allowed. By default only
+                // SRVs (slot 18) get one; UAV, RTV and DSV need X2W_D3D12_VIEW_DEFAULTS=all (view_dimension.h).
+                const auto mode = view_defaults_mode();
+                if (x2w_view_dimension::default_view_allowed(N, dimension, static_cast<unsigned>(resource_desc.Format), mode))
+                    default_view = true;
+                else if (x2w_view_dimension::default_view_allowed(N, dimension, static_cast<unsigned>(resource_desc.Format),
+                                                                  x2w_view_dimension::DefaultViews::all))
+                    skip = mode == x2w_view_dimension::DefaultViews::off
+                        ? "unknown view dimension, and default views are off (X2W_D3D12_VIEW_DEFAULTS=off)"
+                        : "unknown view dimension; a default view of this type needs X2W_D3D12_VIEW_DEFAULTS=all";
+                else
+                    skip = "unknown view dimension, and the resource has no default view";
+                static LONG unknown_dimension;
+                if (first_calls(unknown_dimension, 6))
+                    log("x2w-d3d12 Device::slot%d view dimension 0 (unknown), view format %u, resource dim=%u fmt=%d -> %s", N,
+                        *reinterpret_cast<const UINT*>(described), dimension, resource_desc.Format,
+                        default_view ? "default view" : "skipped");
+            } else if (!x2w_view_dimension::fits(N, view_dimension, dimension)) {
+                skip = "view dimension does not suit the resource";
+                static LONG mismatched;
+                if (first_calls(mismatched, 6))
+                    log("x2w-d3d12 Device::slot%d view dimension %u needs resource dimension %u, resource has %u", N, view_dimension,
+                        x2w_view_dimension::needed(N, view_dimension), dimension);
+            }
+        }
     }
+    // Replace a refused SRV in both the desktop heap and the descriptor record. A skipped UAV, RTV or DSV
+    // does not write a replacement to the desktop heap, so its previous descriptor record must stay live.
+    const auto refuse_view = [&] {
+        if constexpr (N == 18) {
+            UINT requested = D3D12_SRV_DIMENSION_TEXTURE2D;
+            if (args[1] && x2w_local::readable(reinterpret_cast<const void*>(args[1]), 8))
+                std::memcpy(&requested, reinterpret_cast<const unsigned char*>(args[1]) + 4, sizeof(requested));
+            const D3D12_SHADER_RESOURCE_VIEW_DESC null_view = null_srv_desc(requested);
+            device_of(self)->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])});
+            record_view(false);
+        } else if constexpr (N == 17) {
+            record_view(false);  // Translated constant-buffer views use only the descriptor record.
+        } else if constexpr (N == 19) {
+            // A translated compute Dispatch tells this refusal from a descriptor that holds no view by the record.
+            // A refused creation leaves a descriptor that still holds a live view as it is.
+            if (uav_denied && !descriptor_has_live_view(args[D], title_dest)) record_view(false);
+        }
+    };
     if (skip) {
-        record_view(false);
+        refuse_view();
         static LONG skipped;
         if (first_calls(skipped, 6)) log("x2w-d3d12 Device::slot%d view skipped: %s", N, skip);
         return 0;
@@ -4274,7 +4537,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             const auto actual = resource->GetDesc().Format;
             const auto verdict = x2w_startup::packed_view(mapped, actual, x2w_startup::packed_stand_in_of(resource));
             if (verdict == x2w_startup::PackedView::refused) {
-                record_view(false);
+                refuse_view();
                 static LONG refused;
                 if (first_calls(refused, 6))
                     log("x2w-d3d12 Device::slot%d view skipped: packed format %d on a texture of format %d that does not stand in for it",
@@ -4302,6 +4565,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                 *reinterpret_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(b), null_rtv))
             args[1] = reinterpret_cast<u64>(&null_rtv);
     }
+    if (default_view) args[desc_index] = 0;
+    const LONG removed_before = removal_reported;
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
     // A desktop view creation returns void, so the only failure it reports is a removed device. Only a created view
     // may keep the resource: on failure the slot is recorded unmaterialized, which releases the slot's previous view
@@ -4318,6 +4583,19 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     if ((N == 20 || N == 21) && args[0] && created)
         note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]), N);
     check_device("Device view", N);
+    if (!removed_before && removal_reported && N >= 18 && N <= 21) {
+        // The view that removed the device: its forwarded description and the resource's shape.
+        char bytes[3 * 40 + 1] = {};
+        const u64 described = args[desc_index];
+        if (described) hex_text(reinterpret_cast<const void*>(described), 40, bytes, sizeof(bytes));
+        log("x2w-d3d12 Device::slot%d removing view desc %s", N, described ? bytes : "(null)");
+        if (args[0]) {
+            const D3D12_RESOURCE_DESC rd = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc();
+            log("x2w-d3d12 Device::slot%d removing view resource: dim=%d %llux%u depth/array=%u mips=%u fmt=%d samples=%u flags=0x%x", N,
+                rd.Dimension, static_cast<unsigned long long>(rd.Width), rd.Height, rd.DepthOrArraySize, rd.MipLevels, rd.Format,
+                rd.SampleDesc.Count, static_cast<UINT>(rd.Flags));
+        }
+    }
     static LONG calls;
     if (first_calls(calls))
         log("x2w-d3d12 Device::slot%d view(0x%llx, 0x%llx, 0x%llx, 0x%llx) dest 0x%llx -> 0x%llx", N, a, b, c, d,
@@ -4483,6 +4761,70 @@ struct ExistingHeap {
 };
 std::vector<std::pair<void*, ExistingHeap>> existing_heaps;
 
+// Lifetime boundary: one cross-adapter page alias per (heap, page) at a title address, kept for as long as
+// this module is loaded, because the GPU may still read a page the title keeps live for the device's
+// lifetime. It is the function-local static of placed_page_aliases() below, so it is destroyed during
+// this module's CRT teardown -- see startup_stubs/d3d12_teardown.h for the two detaches. On process exit
+// the display driver may already be stopped, so the placed buffers are detached and nothing reaches it;
+// FreeLibrary leaves the process and the driver alive and the pages release their objects normally. The
+// heap and page words are plain addresses, not owned. Each owned buffer is accounted for on the path it
+// took and, with X2W_TEARDOWN_REPORT, reported as one x2w-teardown pages line.
+struct PlacedPageAliases {
+    struct Page {
+        ID3D12Heap* heap;
+        u64 page;
+        x2w_startup::ComPtr<ID3D12Resource> resource;
+    };
+    using iterator = std::array<Page, 64>::iterator;
+    iterator begin() { return entries.begin(); }
+    iterator end() { return entries.end(); }
+
+    // Test hook (startup_teardown_unload, #2572; the review of the ownership change asked for one):
+    // enters one alias for a heap and page the caller owns, where the translated indirect address route
+    // would keep it after its first call. False when that pair is already there or the cache is full. No
+    // real path calls it, and the entry keeps the heap as a key only, as the route does.
+    bool insert_for_test(ID3D12Heap* heap, u64 page, ID3D12Resource* resource)
+    {
+        if (!heap || !resource) return false;
+        for (const Page& entry : entries)
+            if (entry.heap == heap && entry.page == page) return false;
+        for (Page& entry : entries) {
+            if (entry.heap) continue;
+            entry.resource = resource;  // AddRef: the cache owns this reference
+            entry.page = page;
+            entry.heap = heap;
+            return true;
+        }
+        return false;
+    }
+
+    ~PlacedPageAliases()
+    {
+        const bool detach = x2w_startup::d3d12_process_terminating && !x2w_startup::teardown_guard_disabled("pages");
+        unsigned detached = 0, released = 0;
+        for (auto& entry : entries) {
+            if (!entry.resource) continue;
+            if (detach) {
+                entry.resource.Detach();
+                ++detached;
+            } else {
+                ++released;
+            }
+        }
+        x2w_startup::teardown_report("pages", detached, released);
+    }
+    std::array<Page, 64> entries{};
+};
+
+// The cache lives in its own accessor so the fixture probe can reach it, the way
+// indexed_validation_pipeline(device) exposes the validation pipeline. One function-local static, built
+// on the first translated indirect address.
+PlacedPageAliases& placed_page_aliases()
+{
+    static PlacedPageAliases pages{};
+    return pages;
+}
+
 IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 bytes)
 {
     static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS");
@@ -4506,8 +4848,8 @@ IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 by
         [&](const auto& entry) { return entry.first == memory.base; });
     if (known == existing_heaps.end()) return {};
     auto* heap = known->second.real;
-    struct Page { ID3D12Heap* heap; u64 page; x2w_startup::ComPtr<ID3D12Resource> resource; };
-    static std::array<Page, 64> pages{};
+    using Page = PlacedPageAliases::Page;
+    auto& pages = placed_page_aliases();
     auto it = std::find_if(pages.begin(), pages.end(), [&](const Page& entry) { return entry.heap == heap && entry.page == page; });
     if (it != pages.end()) return {it->resource.Get(), offset};
     it = std::find_if(pages.begin(), pages.end(), [](const Page& entry) { return !entry.heap; });
@@ -4816,8 +5158,10 @@ void retire_drop_heap_views(Wrapper* heap)
             const std::uint32_t id = h.shadow[i];
             if (!id) continue;
             h.shadow[i] = 0;
-            if (id - 1 < view_records().size() && view_records()[id - 1].slot == 18 && view_materialized()[id - 1])
-                retire_release_view_ref(reinterpret_cast<const void*>(view_records()[id - 1].resource));
+            // Every tracked view slot loses the ref it held: slots 18-21, slot 19 for the resource and its counter.
+            if (id - 1 < view_records().size() && view_materialized()[id - 1])
+                view_refs_release(view_records()[id - 1].slot, view_records()[id - 1].resource,
+                                  view_records()[id - 1].counter);
         }
     }
     ReleaseSRWLockExclusive(&note_lock);
@@ -4991,34 +5335,6 @@ void retire_resource(Wrapper* w)
     if (!queued) InterlockedIncrement64(&retire_kept);  // stays retained, as without the switch
 }
 
-// A null SRV of the dimension the title's view had (the draw path binds the same R8G8B8A8_UNORM null for a view that
-// resolves to nothing). A null resource reads no more of the description than its format and dimension.
-D3D12_SHADER_RESOURCE_VIEW_DESC retire_null_srv_desc(const ViewRecord& record)
-{
-    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    if (record.desc_bytes >= 40) {
-        D3D12_SRV_DIMENSION dimension;
-        std::memcpy(&dimension, record.desc + 4, sizeof(dimension));
-        if (dimension >= D3D12_SRV_DIMENSION_TEXTURE1D && dimension <= D3D12_SRV_DIMENSION_TEXTURECUBEARRAY)
-            desc.ViewDimension = dimension;
-    }
-    switch (desc.ViewDimension) {
-    case D3D12_SRV_DIMENSION_TEXTURE1D: desc.Texture1D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: desc.Texture1DArray.MipLevels = 1; desc.Texture1DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: desc.Texture2DArray.MipLevels = 1; desc.Texture2DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: desc.Texture2DMSArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE3D: desc.Texture3D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBE: desc.TextureCube.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: desc.TextureCubeArray.MipLevels = 1; desc.TextureCubeArray.NumCubes = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
-    default: desc.Texture2D.MipLevels = 1; break;
-    }
-    return desc;
-}
-
 // True when the release-time fence of every queue has passed (retire_lock held).
 bool retire_fences_reached(const RetiredResource& item)
 {
@@ -5028,106 +5344,10 @@ bool retire_fences_reached(const RetiredResource& item)
     return reached;
 }
 
-// X2W_D3D12_RELEASE_RETIRED_VIEWS=1: a released class member whose release-time fences have passed and that only
-// tracked slot-18 descriptor slots still name gets those slots replaced by null descriptors, so the main drain loop can
-// free it. Every slot of every heap that has a shadow is handled, copies included (they are counted the same way). For
-// each slot, under note_lock: the shadow entry is cleared and its ref dropped, and the desktop descriptor is rewritten
-// as a null SRV of the same dimension. The view records that name the resource then lose it (so a token that a raw
-// title copy left behind resolves to nothing), and the token in title descriptor memory is cleared when it still
-// carries the id. A slot that cannot be rewritten keeps its ref, and the resource stays retained. Nothing waits.
-// Why this cannot reach GPU work: translated draws never bind a title heap. They build their own descriptors from the
-// title's tokens at draw time and retire_hold what they sample, so a descriptor of a title heap is read by no recorded
-// list or submission (ClearUnorderedAccessView binds a heap for UAV slots only, and those are not touched here).
-void retire_null_ready_views()
-{
-    std::vector<Wrapper*> ready;
-    try {
-        ready.reserve(64);
-    } catch (const std::bad_alloc&) {
-        return;
-    }
-    if (!TryAcquireSRWLockShared(&retire_lock)) return;
-    for (const RetiredResource& item : retired_resources) {
-        Wrapper* w = item.wrapper;
-        if (ready.size() == ready.capacity()) break;
-        if (w->own().retire_hold_missed || w->own().retire_views_stuck || !retire_fences_reached(item)) continue;
-        if (InterlockedCompareExchange(&w->own().retire_view_refs, 0, 0) <= 0) continue;
-        if (InterlockedCompareExchange(&w->own().refs, 0, 0) != 0) continue;  // referenced again: leave its views
-        ready.push_back(w);
-    }
-    ReleaseSRWLockShared(&retire_lock);
-    if (ready.empty()) return;
-
-    struct Cleared {
-        u64 title_cpu;
-        std::uint32_t index, increment, id;
-    };
-    std::vector<Cleared> cleared;
-    std::size_t stuck = 0;
-    // draw_lock first, in the order draw_translated takes them: a draw holds it from reading a view record until it
-    // retire_holds the texture, so clearing the records under it means a draw either recorded its hold already or
-    // resolves the token to nothing.
-    if (!TryAcquireSRWLockExclusive(&draw_lock)) return;
-    if (!TryAcquireSRWLockExclusive(&note_lock)) {
-        ReleaseSRWLockExclusive(&draw_lock);
-        return;
-    }
-    try {
-        std::unordered_set<std::uint32_t> ids;  // view ids that name a ready resource
-        for (std::uint32_t id = 0; id < view_records().size(); ++id) {
-            const ViewRecord& record = view_records()[id];
-            if (record.slot != 18 || !view_materialized()[id]) continue;
-            if (std::find(ready.begin(), ready.end(), reinterpret_cast<Wrapper*>(record.resource)) != ready.end())
-                ids.insert(id);
-        }
-        ID3D12Device* const device = the_device ? device_of(the_device) : nullptr;
-        for (const HeapInfo& h : heap_infos()) {
-            if (!h.shadow || ids.empty() || !device || !h.desktop_cpu) continue;
-            for (std::uint32_t i = 0; i < h.count; ++i) {
-                const std::uint32_t slot_id = h.shadow[i];
-                if (!slot_id || !ids.count(slot_id - 1)) continue;
-                const ViewRecord& record = view_records()[slot_id - 1];
-                const D3D12_SHADER_RESOURCE_VIEW_DESC null_view = retire_null_srv_desc(record);
-                device->CreateShaderResourceView(nullptr, &null_view,
-                    D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(h.desktop_cpu + u64{i} * h.increment)});
-                h.shadow[i] = 0;
-                retire_release_view_ref(reinterpret_cast<const void*>(record.resource));
-                if (h.title_cpu && h.title_cpu != h.desktop_cpu) cleared.push_back({h.title_cpu, i, h.increment, slot_id - 1});
-            }
-        }
-        for (Wrapper* w : ready) {
-            if (InterlockedCompareExchange(&w->own().retire_view_refs, 0, 0) > 0) {
-                w->own().retire_views_stuck = true;
-                ++stuck;
-                continue;
-            }
-            for (std::uint32_t id : ids)
-                if (view_records()[id].resource == reinterpret_cast<u64>(w)) view_records()[id].resource = 0;
-        }
-    } catch (const std::bad_alloc&) {
-    }
-    ReleaseSRWLockExclusive(&note_lock);
-    ReleaseSRWLockExclusive(&draw_lock);
-    for (const Cleared& slot : cleared) {
-        const u64 token = slot.title_cpu + u64{slot.index} * title_descriptor_stride(slot.title_cpu, slot.increment);
-        if (!title_backed(token, 32) || !x2w_local::writable(reinterpret_cast<void*>(token), 32)) continue;
-        std::uint32_t words[2];
-        std::memcpy(words, reinterpret_cast<const void*>(token), sizeof(words));
-        if (words[0] == view_token_magic && words[1] == slot.id)
-            InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(token), 0, static_cast<LONG>(view_token_magic));
-    }
-    if (stuck) {
-        static LONG reported;
-        if (first_calls(reported, 4)) log("x2w-d3d12 retire: %zu released textures keep an untracked descriptor; they stay retained", stuck);
-    }
-}
-
-
 // Never blocks: a contended lock or an unfinished queue leaves the work for the next call.
 void drain_retired_resources()
 {
     if (!InterlockedCompareExchange(&retire_pending, 0, 0)) return;
-    if (release_retired_views_enabled()) retire_null_ready_views();
     constexpr std::size_t batch = 256;
     struct RetiredDrop {
         Wrapper* wrapper;
@@ -5158,10 +5378,7 @@ void drain_retired_resources()
             ++i;
             continue;
         }
-        bool reached = item.targets.size() <= retire_queues.size();
-        for (std::size_t q = 0; q < item.targets.size() && reached; ++q)
-            reached = retire_queues[q].fence->GetCompletedValue() >= item.targets[q];
-        if (!reached) {
+        if (!retire_fences_reached(item)) {
             ++i;
             continue;
         }
@@ -5226,7 +5443,8 @@ void drain_retired_resources()
 // is recorded and no line is built.
 bool retire_reasons_enabled()
 {
-    static const bool on = release_retired_enabled() && x2w_budget::enabled() && x2w_local::env_on("X2W_D3D12_RETIRE_REASONS");
+    static const bool on = release_retired_enabled() && x2w_budget::enabled() &&
+        (legacy_retire_view_stats() || x2w_local::env_on("X2W_D3D12_RETIRE_REASONS"));
     return on;
 }
 
@@ -5445,29 +5663,33 @@ extern "C" __declspec(dllexport) void x2w_d3d12_fail_wraps(LONG count)
 }
 
 // Fixture probe (startup_resource_retire): what still names a resource of the class by its raw desktop pointer, how many
-// resources the open recording of a list moved out of COMMON, and how many it holds. Counts entries only.
+// resources the open recording of a list moved out of COMMON, how many it holds, and how many tracked descriptor slots
+// hold the resource (retire_view_refs, slots 18-21). Counts entries only.
 struct RetireProbe {
     unsigned cache_entries;
     unsigned list_states;
     unsigned list_holds;
+    unsigned view_refs;
 };
 extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, void* list, RetireProbe* out)
 {
     if (!out) return FALSE;
     *out = {};
     if (!release_retired_enabled()) return FALSE;  // like x2w_d3d12_budget_snapshot: nothing to report without the switch
-    if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind && r->own().real) {
-        auto* real = static_cast<ID3D12Resource*>(r->own().real);
-        AcquireSRWLockExclusive(&draw_lock);
-        out->cache_entries += static_cast<unsigned>(texture_uploads().count(real));
-        ReleaseSRWLockExclusive(&draw_lock);
-        AcquireSRWLockShared(&target_lock);
-        for (const auto& view : view_targets()) out->cache_entries += view.second.resource == real;
-        ReleaseSRWLockShared(&target_lock);
-        AcquireSRWLockShared(&pending_writes_lock);
-        for (const auto& writes : pending_gpu_writes())
-            out->cache_entries += static_cast<unsigned>(std::count(writes.second.begin(), writes.second.end(), real));
-        ReleaseSRWLockShared(&pending_writes_lock);
+    if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind) {
+        out->view_refs = static_cast<unsigned>(InterlockedCompareExchange(&r->own().retire_view_refs, 0, 0));
+        if (auto* real = static_cast<ID3D12Resource*>(r->own().real)) {
+            AcquireSRWLockExclusive(&draw_lock);
+            out->cache_entries += static_cast<unsigned>(texture_uploads().count(real));
+            ReleaseSRWLockExclusive(&draw_lock);
+            AcquireSRWLockShared(&target_lock);
+            for (const auto& view : view_targets()) out->cache_entries += view.second.resource == real;
+            ReleaseSRWLockShared(&target_lock);
+            AcquireSRWLockShared(&pending_writes_lock);
+            for (const auto& writes : pending_gpu_writes())
+                out->cache_entries += static_cast<unsigned>(std::count(writes.second.begin(), writes.second.end(), real));
+            ReleaseSRWLockShared(&pending_writes_lock);
+        }
     }
     if (Wrapper* l = as_wrapper(list); l && l->own().kind == list_kind) {
         if (l->own().pass) out->list_states = static_cast<unsigned>(pass_of(l).states.size());
@@ -5479,16 +5701,28 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
     return TRUE;
 }
 
-// Fixture probe (startup_teardown_unload, #2572) for the two caches that keep desktop objects for a
-// device: the indexed-validation pipeline (d3d12_draw.inl, bit 0) and the rectangle-list argument
-// converter (rect_indirect_args.h, bit 1). Warms the selected caches the way their first real call
-// would -- the validation pipeline directly, the converter through one record-only conversion, nothing
-// executed -- and answers how many objects they now hold for `device`: the validation entry's device,
-// root signature and pipeline (3), plus the converter entry's root signature and pipeline (2). The
-// caller can warm one cache at a time to see each one release what it owns when the module is unloaded.
-extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Device* device, UINT caches)
+// Fixture probe (startup_teardown_unload, #2572) for the four caches that keep desktop objects for a
+// device, one bit each: the indexed-validation pipeline (d3d12_draw.inl, bit 1) and the rectangle-list
+// argument converter (rect_indirect_args.h, bit 2), the placed page aliases of the translated indirect
+// address route (bit 4) and the draw-dump readbacks (bit 8). Warms the selected caches the way their
+// first real call would -- the validation pipeline directly, the converter through one record-only
+// conversion, an alias entry on a placed buffer of this device, a recorded readback -- and answers how
+// many objects they now hold for `device`: the validation entry's device, root signature and pipeline
+// (3), the converter entry's root signature and pipeline (2), the alias entry's placed buffer (1), the
+// readback entry's buffer and fence (2). The caller can warm one cache at a time to see each one release
+// what it owns when the module is unloaded.
+//
+// `placed_heap` is how bit 4 hands the heap it creates over to the caller. The alias entry keeps that heap
+// as a key only -- it owns no reference, as the route's heap belongs to the device's allocation -- so the
+// one reference this probe holds is the caller's from the moment the entry is entered, and the caller must
+// release it after the cache released the placed buffer (a heap must outlive the resources placed in it).
+// Bit 4 is not warmed when `placed_heap` is null: an entry whose backing heap nobody owns is the leak this
+// handover exists to rule out. Every other bit leaves `*placed_heap` null.
+extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Device* device, UINT caches,
+                                                                    ID3D12Heap** placed_heap)
 {
-    if (!device || !caches || (caches & ~3u)) return 0;
+    if (placed_heap) *placed_heap = nullptr;
+    if (!device || !caches || (caches & ~15u)) return 0;
     UINT owned = 0;
     if (caches & 1u) {
         const auto& validation = indexed_validation_pipeline(device);
@@ -5496,29 +5730,145 @@ extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Devic
         if (validation.root) ++owned;
         if (validation.pipeline) ++owned;
     }
-    if (!(caches & 2u)) return owned;
+    if (caches & 2u) {
+        x2w_startup::ComPtr<ID3D12CommandAllocator> allocator;
+        x2w_startup::ComPtr<ID3D12GraphicsCommandList> list;
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                            IID_PPV_ARGS(&list))))
+            return owned;
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 256;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        // convert() copies its 16 source words; an uninitialised buffer in the state it requires is enough.
+        x2w_startup::ComPtr<ID3D12Resource> source;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                   nullptr, IID_PPV_ARGS(&source))))
+            return owned;
+        const auto scratch = x2w_startup::RectIndirectArguments::make_scratch(device);
+        if (scratch && x2w_startup::rect_indirect_arguments().convert(list.Get(), source.Get(), 0, scratch.Get()))
+            owned += 2;  // the converter's root signature and pipeline for this device
+    }
+    if (!(caches & 12u)) return owned;
 
-    x2w_startup::ComPtr<ID3D12CommandAllocator> allocator;
-    x2w_startup::ComPtr<ID3D12GraphicsCommandList> list;
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-                                        IID_PPV_ARGS(&list))))
-        return owned;
-    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC buffer{};
-    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer.Width = 256;
-    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
-    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    // convert() copies its 16 source words; an uninitialised buffer in the state it requires is enough.
-    x2w_startup::ComPtr<ID3D12Resource> source;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                               nullptr, IID_PPV_ARGS(&source))))
-        return owned;
-    const auto scratch = x2w_startup::RectIndirectArguments::make_scratch(device);
-    if (scratch && x2w_startup::rect_indirect_arguments().convert(list.Get(), source.Get(), 0, scratch.Get()))
-        owned += 2;  // the converter's root signature and pipeline for this device
+    // The two caches below hold desktop objects, as their real entries do: draw_dump_after() creates the
+    // readback buffer on the desktop device, and execute() creates the fence on the desktop device it
+    // reads from the desktop queue. Two shapes of device reach this probe. A title gets a wrapper from
+    // D3D12XboxCreateDevice (attach_device wraps the created device), and the desktop device is then the
+    // one behind it. A fixture creates its device without a parameter block, so that entry returns a
+    // plain D3D12CreateDevice() result: an unwrapped desktop device. The handle itself is the desktop
+    // device then. removal_device is not a fallback: attach_device is where it is written, so on the
+    // unwrapped path it is null or names another device.
+    Wrapper* wrapper = as_wrapper(device);
+    ID3D12Device* desktop = wrapper ? device_of(wrapper) : device;
+
+    // Diagnostics for the fixture, off unless X2W_CACHE_PROBE_DEBUG is set: one line per step, so a probe
+    // that answers fewer objects than expected names the call that refused. Temporary, together with the
+    // two caches they measure.
+    char probe_debug[2]{};
+    const bool trace = GetEnvironmentVariableA("X2W_CACHE_PROBE_DEBUG", probe_debug, sizeof(probe_debug)) != 0;
+    if (trace)
+        std::fprintf(stderr, "x2w-cache-probe device=%p wrapper=%p desktop=%p caches=0x%x\n",
+                     static_cast<void*>(device), static_cast<void*>(wrapper), static_cast<void*>(desktop), caches);
+
+    // Bit 4 needs an owner for the heap it creates, and that owner is the caller: with no out pointer
+    // there is nowhere to put the reference, so the alias is not warmed at all rather than entered on a
+    // heap nobody owns for the rest of the process.
+    if ((caches & 4u) && !placed_heap && trace)
+        std::fputs("x2w-cache-probe placed: no heap out pointer, bit 4 not warmed\n", stderr);
+    if ((caches & 4u) && placed_heap) {
+        // One placed buffer on a heap of this device, entered where the translated indirect address route
+        // keeps its aliases. The page word is only the cache key: no title address is involved here, and
+        // the entry never dereferences the heap. The route's buffers carry ALLOW_CROSS_ADAPTER; sharing
+        // them across adapters needs a heap opened for it and plays no part in the lifetime measured
+        // here, so this buffer is an ordinary placed buffer.
+        D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_HEAP_DESC heap_desc{};
+        heap_desc.SizeInBytes = 65536;
+        heap_desc.Properties = properties;
+        heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        x2w_startup::ComPtr<ID3D12Heap> heap;
+        const HRESULT heap_hr = desktop->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe heap hr=0x%08lx\n", static_cast<unsigned long>(heap_hr));
+        if (FAILED(heap_hr)) return owned;
+        const D3D12_RESOURCE_DESC placed{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+                                         {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        x2w_startup::ComPtr<ID3D12Resource> alias;
+        const HRESULT placed_hr = desktop->CreatePlacedResource(heap.Get(), 0, &placed, D3D12_RESOURCE_STATE_COMMON,
+                                                               nullptr, IID_PPV_ARGS(&alias));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe placed hr=0x%08lx\n", static_cast<unsigned long>(placed_hr));
+        if (FAILED(placed_hr)) return owned;
+        {
+            std::lock_guard lock(placed_mutex);
+            auto& pages = placed_page_aliases();
+            const bool entered = pages.insert_for_test(heap.Get(), 0x10000, alias.Get());
+            unsigned used = 0;
+            for (const auto& entry : pages)
+                if (entry.heap) ++used;
+            if (trace) std::fprintf(stderr, "x2w-cache-probe insert=%d used=%u/64\n", entered ? 1 : 0, used);
+            if (entered) {
+                // The route's heap belongs to the device's allocation, not to an alias entry: the shim
+                // keeps it for the device's lifetime, and the entry only stores the pointer. This probe
+                // created its own heap, so the one reference it holds is not abandoned here but handed to
+                // the caller, who owns it from now on and releases it after the placed buffer this entry
+                // keeps -- a heap must outlive the resources placed in it.
+                *placed_heap = heap.Detach();
+                ++owned;
+            }
+        }
+    }
+    if (caches & 8u) {
+        // One recorded draw readback: the READBACK buffer draw_dump_after() keeps and the queue fence
+        // execute() attaches once the copy is submitted. execute() builds both on the desktop device it
+        // reads from the desktop queue, so both are desktop objects here too.
+        D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 256;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        x2w_startup::ComPtr<ID3D12Resource> staging;
+        x2w_startup::ComPtr<ID3D12Fence> fence;
+        const HRESULT staging_hr = desktop->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                    IID_PPV_ARGS(&staging));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe readback hr=0x%08lx\n", static_cast<unsigned long>(staging_hr));
+        if (FAILED(staging_hr)) return owned;
+        const HRESULT fence_hr = desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe fence hr=0x%08lx\n", static_cast<unsigned long>(fence_hr));
+        if (FAILED(fence_hr)) return owned;
+        const bool recorded = draw_dumps().record_for_test(std::move(staging), std::move(fence));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe record=%d\n", recorded ? 1 : 0);
+        if (recorded) owned += 2;
+    }
     return owned;
+}
+
+// Fixture probe (startup_teardown_unload, #2572) for the ownership of the two caches above: hands the
+// caller one reference to an object a warmed entry owns, so the fixture can watch that reference go away
+// when the module is unloaded. `cache` and `slot`: 4/0 the placed buffer, 8/0 the readback buffer, 8/1 its
+// fence; null for anything else. The caller's reference keeps the object alive after the module is gone,
+// which is what makes its count readable then.
+extern "C" __declspec(dllexport) IUnknown* x2w_d3d12_cached_object_probe(UINT cache, UINT slot)
+{
+    IUnknown* object = nullptr;
+    if (cache == 4u) {
+        std::lock_guard lock(placed_mutex);
+        auto& pages = placed_page_aliases();
+        for (auto& entry : pages) {
+            if (!entry.resource) continue;
+            object = entry.resource.Get();
+            break;
+        }
+    } else if (cache == 8u) {
+        object = draw_dumps().owned_for_test(slot);
+    }
+    if (!object) return nullptr;
+    object->AddRef();
+    return object;
 }
 
 // Fixture probes (startup_resource_retire_title) for state the retire bookkeeping maintains for one resource. They read
@@ -5823,9 +6173,15 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
         hex_text(desc, 96, bytes, sizeof(bytes));
         log("x2w-d3d12 Device::slot%d(pipeline?) desc=[%s] riid=%s -> placeholder", N, bytes, text);
     }
-    if constexpr (N == 67) publish_compute_request(desc);
     *out = wrap(nullptr, pipeline_kind);
     if (!*out) return E_OUTOFMEMORY;
+    if constexpr (N == 67) {
+        // A translated Dispatch finds its program by this key (d3d12_compute_dispatch.inl).
+        if (const u64 key = publish_compute_request(desc)) {
+            static_cast<Wrapper*>(*out)->own().compute_request_key = key;
+            static_cast<Wrapper*>(*out)->own().compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
+        }
+    }
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
     return S_OK;
 }
@@ -6311,6 +6667,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+    if (render_mode() && frame % 300 == 0) {
+        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld",
+            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled);
+        log_compute_census();
+    }
     if (render_mode() && frame % 300 == 0) {
         // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
         static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
