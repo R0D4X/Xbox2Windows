@@ -109,6 +109,7 @@ public:
         DXGI_FORMAT rtv_format,
         DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN);
 
+    // The mesh path accepts up to 64 vertices and 126 primitives per meshlet.
     MeshletGpuResources create_gpu_resources(ID3D12Device* device, const MeshletBufferData& data) const;
 
     void record_draw(

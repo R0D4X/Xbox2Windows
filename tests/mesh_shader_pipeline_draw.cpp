@@ -73,6 +73,28 @@ RenderResult render_scene(ID3D12Device* device, const MeshletBufferData& scene, 
         throw std::runtime_error("MeshShaderPipeline::initialize unexpectedly returned false");
     }
 
+    if (pipeline.using_mesh_shaders()) {
+        using namespace x2w::meshlet;
+        const auto expect_refusal = [&](const std::vector<MeshletVertex>& vertices, const std::vector<std::uint32_t>& indices) {
+            const auto oversized = build_meshlets(vertices, indices, kHardwareMaxMeshletVertices, kHardwareMaxMeshletPrimitives);
+            try {
+                pipeline.create_gpu_resources(device, oversized);
+            } catch (const std::invalid_argument&) {
+                return;
+            }
+            throw std::runtime_error("Meshlet exceeding the shader output capacity was accepted");
+        };
+
+        std::vector<MeshletVertex> vertices(kMaxMeshletVertices + 1, scene.vertices.front());
+        std::vector<std::uint32_t> indices;
+        for (std::uint32_t i = 0; i < vertices.size(); ++i) indices.push_back(i);
+        indices.push_back(0);
+        expect_refusal(vertices, indices);
+        indices.clear();
+        for (std::uint32_t i = 0; i <= kMaxMeshletPrimitives; ++i)
+            indices.insert(indices.end(), {0, 1, 2});
+        expect_refusal(scene.vertices, indices);
+    }
     const MeshletGpuResources res = pipeline.create_gpu_resources(device, scene);
     const SceneConstantsGPU cb_data = make_scene_constants(res.meshlet_count);
 

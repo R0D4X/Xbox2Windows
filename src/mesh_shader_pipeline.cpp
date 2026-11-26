@@ -311,6 +311,12 @@ bool MeshShaderPipeline::initialize(
 MeshletGpuResources MeshShaderPipeline::create_gpu_resources(ID3D12Device* device, const MeshletBufferData& data) const {
     if (!device) throw std::invalid_argument("MeshShaderPipeline::create_gpu_resources requires a valid ID3D12Device");
 
+    if (using_mesh_shaders_ && std::any_of(data.meshlets.begin(), data.meshlets.end(), [](const MeshletDescriptor& meshlet) {
+            return meshlet.vertex_count > kMaxMeshletVertices || meshlet.primitive_count > kMaxMeshletPrimitives;
+        })) {
+        throw std::invalid_argument("Meshlet exceeds the mesh shader output capacity (64 vertices, 126 primitives)");
+    }
+
     MeshletGpuResources res;
     const std::size_t vb_bytes = data.vertices.size() * sizeof(MeshletVertex);
     const std::size_t ib_bytes = data.source_indices.size() * sizeof(std::uint32_t);
