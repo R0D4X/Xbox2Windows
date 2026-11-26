@@ -9,11 +9,12 @@
 // buffers named by the hardware descriptors in its tables, textures behind view tokens) into an
 // upload ring / a private descriptor heap.
 
-// A pixel-stage image store (#1996 item F): tools/startup/gfx2hlsl.py writes 'uav N tex2d table P O' for the
-// RWTexture2D<float4> at u<N>, whose descriptor is at byte O of the title's root table P. Only that form is
-// read; a view qualifier or a 'channels' field, as in the compute line, is refused.
+// A pixel-stage image store (#1996 item F, #2742): tools/startup/gfx2hlsl.py writes 'uav N tex2d|tex2da table P O'
+// for the RWTexture2D<float4> or RWTexture2DArray<float4> at u<N>, whose descriptor is at byte O of the title's
+// root table P. Only that form is read; a view qualifier or a 'channels' field, as in the compute line, is refused.
 struct PixelUav {
     unsigned index = 0, parameter = 0, offset = 0;
+    bool array = false;
 };
 constexpr unsigned pixel_uav_limit = 8;
 
@@ -34,7 +35,8 @@ const char* read_pixel_uav_line(const std::string& line, PixelUav& out)
     if (w.size() < 2 || w[0] != "uav" || !number(w[1], out.index)) return "malformed view index";
     if (w.size() < 3) return "missing view kind";
     if (w[2] == "raw" || w[2] == "table") return "buffer view (raw uav) is not bound";
-    if (w[2] != "tex2d") return "only tex2d views are bound";
+    if (w[2] != "tex2d" && w[2] != "tex2da") return "only tex2d and tex2da views are bound";
+    out.array = w[2] == "tex2da";
     if (w.size() > 3 && (w[3] == "float" || w[3] == "uint" || w[3] == "sint")) return "a view qualifier is not read for pixel stores";
     if (w.size() < 4 || w[3] != "table") return "view source is not a table";
     if (w.size() < 6) return "missing table parameter or offset";
@@ -84,18 +86,29 @@ bool srgb_uav_format(DXGI_FORMAT format)
            format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
 }
 
-// The view of mip 0 of a 2D texture for a pixel UAV. resource is the desktop description, title_view the title's
-// own view (nullptr when it passed none) with console format values already mapped. Returns nullptr and fills
-// out, or the reason the binding is refused.
+// The view of mip 0 of a 2D or 2D-array texture for a pixel UAV. resource is the desktop description, title_view
+// the title's own view (nullptr when it passed none) with console format values already mapped, and array is true
+// for a manifest 'tex2da' view. Returns nullptr and fills out, or the reason the binding is refused.
 const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& resource,
-                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, D3D12_UNORDERED_ACCESS_VIEW_DESC& out)
+                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, bool array,
+                           D3D12_UNORDERED_ACCESS_VIEW_DESC& out)
 {
     if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return "resource is not a 2D texture";
-    if (resource.DepthOrArraySize != 1) return "resource is a texture array";
+    if (!array && resource.DepthOrArraySize != 1) return "resource is a texture array";
     if (resource.SampleDesc.Count != 1) return "resource is multisampled";
     if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return "resource lacks ALLOW_UNORDERED_ACCESS";
     DXGI_FORMAT format = resource.Format;
-    if (title_view) {
+    if (array) {
+        if (!title_view || title_view->ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+            return "view is not a 2D array texture view";
+        const auto& a = title_view->Texture2DArray;
+        if (a.MipSlice != 0) return "view names a mip other than 0";
+        if (a.PlaneSlice != 0) return "view names a plane other than 0";
+        if (a.FirstArraySlice >= resource.DepthOrArraySize || !a.ArraySize ||
+            a.ArraySize > resource.DepthOrArraySize - a.FirstArraySlice)
+            return "array view slice range is outside the resource";
+        if (title_view->Format != DXGI_FORMAT_UNKNOWN) format = title_view->Format;
+    } else if (title_view) {
         if (title_view->ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D) return "view is not a 2D texture view";
         if (title_view->Texture2D.MipSlice != 0) return "view names a mip other than 0";
         if (title_view->Texture2D.PlaneSlice != 0) return "view names a plane other than 0";
@@ -110,7 +123,12 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
         return "format has no typed UAV store on this device";
     out = {};
     out.Format = format;
-    out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    if (array) {
+        out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        out.Texture2DArray = title_view->Texture2DArray;
+    } else {
+        out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    }
     return nullptr;
 }
 
@@ -2080,7 +2098,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             title_view.Format = desktop_format(title_view.Format);
         }
         const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, out[i].view);
+        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, uav.array, out[i].view);
         if (reason) {
             static LONG refused_view;
             if (first_calls(refused_view, 16))
@@ -2539,9 +2557,16 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         require_state(self, uav_bindings[j].resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         device_of(the_device)->CreateUnorderedAccessView(uav_bindings[j].resource, nullptr, &uav_bindings[j].view, dest);
         static LONG shown;
-        if (first_calls(shown, 6))
-            log("x2w-draw   %016llx uav %u: resource %p format %d mip 0", tr->key, j, static_cast<void*>(uav_bindings[j].resource),
-                uav_bindings[j].view.Format);
+        if (first_calls(shown, 6)) {
+            if (uav_bindings[j].view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+                log("x2w-draw   %016llx uav %u: resource %p format %d array [%u..%u) mip 0", tr->key, j,
+                    static_cast<void*>(uav_bindings[j].resource), uav_bindings[j].view.Format,
+                    uav_bindings[j].view.Texture2DArray.FirstArraySlice,
+                    uav_bindings[j].view.Texture2DArray.FirstArraySlice + uav_bindings[j].view.Texture2DArray.ArraySize);
+            else
+                log("x2w-draw   %016llx uav %u: resource %p format %d mip 0", tr->key, j,
+                    static_cast<void*>(uav_bindings[j].resource), uav_bindings[j].view.Format);
+        }
     }
     static LONG checks;
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated draw views", 0);

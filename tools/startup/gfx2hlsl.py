@@ -7443,7 +7443,7 @@ class Stage:
         if len(dims) != 1 or len(masks) != 1:
             raise Unsupported('%s without exactly one dim and dmask' % name)
         array = dims[0] == 'SQ_RSRC_IMG_2D_ARRAY'
-        if dims[0] != 'SQ_RSRC_IMG_2D' and (not array or self.kind != 'cs'):
+        if dims[0] not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_2D_ARRAY'):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
         try:
             mask = int(masks[0], 0)
