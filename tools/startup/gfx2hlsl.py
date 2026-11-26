@@ -10031,6 +10031,29 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 self.set_scc((cast % op).format(self.u(ops[0]), '0x%08xu' % sopk_imm(ops[1], signed)))
             return handler
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make_cmpk())
+# s_cmp_eq_u64 / s_cmp_lg_u64: SCC = (S0.u64 == S1.u64) / (S0.u64 != S1.u64).
+for _name, _op, _join in (('eq', '==', '&&'), ('lg', '!=', '||')):
+    def _make_cmp64(op=_op, join=_join, name='s_cmp_%s_u64' % _name):
+        def handler(self, ops, mods):
+            if len(ops) != 2 or mods:
+                raise Unsupported('%s requires two unmodified operands' % name)
+            if any(self.is_lane_mask(tok) for tok in ops):
+                raise Unsupported('%s on a lane mask' % name)
+            masks = getattr(self, 'masks', ())
+            mask_high = getattr(self, 'mask_high', ())
+            words = []
+            for tok in ops:
+                r = reg_range(tok)
+                if r:
+                    if r[0] != 's':
+                        raise Unsupported('%s source %s' % (name, tok))
+                    if any(w in masks or w in mask_high for w in range(r[1], r[2] + 1)):
+                        raise Unsupported('%s on a lane mask' % name)
+                words.append(('0u', '0u') if tok == 'null' else self.i64_words(tok, False, True))
+            (a0, a1), (b0, b1) = words
+            self.set_scc('((%s %s %s) %s (%s %s %s))' % (a0, op, b0, join, a1, op, b1))
+        return handler
+    setattr(Stage, 'op_s_cmp_%s_u64' % _name, _make_cmp64())
 # Scalar bit counts and scans with a 32-bit result. `lo`/`hi` are the uint words of the source: a 32-bit source has only
 # `lo`. The scans return 0xffffffff (-1) when no bit qualifies. Only the counts set SCC (result != 0).
 def _clz64(lo, hi):
