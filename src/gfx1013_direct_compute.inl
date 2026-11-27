@@ -1167,12 +1167,13 @@ struct DirectCompute {
         const auto rule = alu_rules.find(n);
         const bool byte_to_float =
             n.size() == 16 && n.substr(0, 15) == "v_cvt_f32_ubyte" && n.back() >= '0' && n.back() <= '3';
+        const bool off_i4_to_float = n == "v_cvt_off_f32_i4";
         const bool round = n == "v_fract_f32" || n == "v_trunc_f32" || n == "v_ceil_f32";
         const bool to_integer = n == "v_cvt_i32_f32" || n == "v_cvt_u32_f32" ||
                                 n == "v_cvt_flr_i32_f32" || n == "v_cvt_rpi_i32_f32";
         const bool cube = n == "v_cubeid_f32" || n == "v_cubesc_f32" || n == "v_cubetc_f32" || n == "v_cubema_f32";
         const bool mixed = i.enc == Encoding::Mix && (n == "v_fma_mix_f32" || n == "v_fma_mixlo_f16" || n == "v_fma_mixhi_f16");
-        if (!mixed && !to_integer && !byte_to_float && !round && !cube && n != "v_mul_legacy_f32" &&
+        if (!mixed && !to_integer && !byte_to_float && !off_i4_to_float && !round && !cube && n != "v_mul_legacy_f32" &&
             n != "v_cos_f32" && (rule == alu_rules.end() || rule->second.type == AluType::Bits))
             return false;
         auto source = [&](unsigned j) {
@@ -1247,9 +1248,13 @@ struct DirectCompute {
             }
             return true;
         }
-        if (byte_to_float || (rule != alu_rules.end() && rule->second.type == AluType::ToFloat)) {
+        if (byte_to_float || off_i4_to_float || (rule != alu_rules.end() && rule->second.type == AluType::ToFloat)) {
             if (i.abs || i.neg)
                 refuse(i.pc, "integer conversion source modifier");
+            if (off_i4_to_float && i.wide && (i.src[1] != 0 || i.src[2] != 0))
+                refuse(i.pc, "v_cvt_off_f32_i4 with unused src1/src2 field set");
+            if (off_i4_to_float && i.wide && (i.a & 0x7800))
+                refuse(i.pc, "v_cvt_off_f32_i4 with op_sel");
             auto a = source(0);
             if (byte_to_float) {
                 unsigned shift_bits = 8u * (n.back() - '0');
@@ -1257,7 +1262,13 @@ struct DirectCompute {
                     a = ir.binary("lshr", a, to_string(shift_bits));
                 a = ir.binary("and", a, "255");
             }
-            result = ir.value(string(n == "v_cvt_f32_i32" ? "sitofp" : "uitofp") + " i32 " + a + " to float");
+            if (off_i4_to_float) {
+                auto nibble = ir.binary("ashr", ir.binary("shl", a, "28"), "28");
+                auto f = ir.value("sitofp i32 " + nibble + " to float");
+                result = ir.value("fmul float " + f + ", 0.0625");
+            } else {
+                result = ir.value(string(n == "v_cvt_f32_i32" ? "sitofp" : "uitofp") + " i32 " + a + " to float");
+            }
         } else {
             auto a = fp(0);
             if (n == "v_fma_f32" || n == "v_fmac_f32" || n == "v_fmamk_f32" || n == "v_fmaak_f32") {
