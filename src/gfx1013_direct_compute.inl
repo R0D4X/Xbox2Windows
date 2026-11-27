@@ -1534,7 +1534,8 @@ struct DirectCompute {
                     n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" || n == "s_not_b32" ||
                     n == "s_lshr_b32" || n == "s_lshl_b32" || n == "s_ashr_i32" ||
                     n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64" || n == "s_xor_b32" ||
-                    n == "s_bfe_u64" || n == "s_bfe_i64";
+                    n == "s_bfe_u64" || n == "s_bfe_i64" ||
+                    n == "s_lshl1_add_u32" || n == "s_lshl2_add_u32" || n == "s_lshl3_add_u32" || n == "s_lshl4_add_u32";
                 const bool preserves_pair = n == "s_mul_i32" || n == "s_mul_hi_i32" || n == "s_mul_hi_u32" ||
                     n == "s_bfm_b32" || n == "s_bfm_b64" || n == "s_pack_ll_b32_b16" || n == "s_pack_lh_b32_b16" ||
                     n == "s_pack_hh_b32_b16";
@@ -2177,6 +2178,18 @@ struct DirectCompute {
             z = select(cmp("slt", a, "0"), ir.binary("sub", "0", a), a);
         else if (n == "v_add_nc_u32" || n == "s_add_u32")
             z = ir.binary("add", a, b);
+        else if (n == "s_lshl1_add_u32" || n == "s_lshl2_add_u32" ||
+                 n == "s_lshl3_add_u32" || n == "s_lshl4_add_u32") {
+            const unsigned k = static_cast<unsigned>(n[6] - '0');
+            auto shifted = ir.binary("shl", a, to_string(k));
+            z = ir.binary("add", shifted, b);
+            auto shift_overflow = cmp("ne", ir.binary("lshr", a, to_string(32 - k)), "0");
+            auto add_carry = cmp("ult", z, shifted);
+            auto flag = ir.value("or i1 " + shift_overflow + ", " + add_carry);
+            write(i.dst, z);
+            write(128, ir.value("zext i1 " + flag + " to i32"));
+            return;
+        }
         else if (n == "s_sub_u32" || n == "v_sub_nc_u32")
             z = ir.binary("sub", a, b);
         else if (n == "v_subrev_nc_u32")
