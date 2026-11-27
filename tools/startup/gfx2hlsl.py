@@ -9436,6 +9436,36 @@ class Stage:
     def op_v_cubema_f32(self, ops, mods):
         self.cube('ma', ops, mods)
 
+    def _packed_add_sub_16(self, base, signed, is_sub, ops, mods):
+        clamp_count = sum(1 for m in mods if m == 'clamp')
+        if clamp_count > 1:
+            raise Unsupported('%s with duplicate clamp' % base)
+        rest_mods = [m for m in mods if m != 'clamp']
+        if clamp_count:
+            if signed:
+                op = '-' if is_sub else '+'
+                expr = '(asuint(clamp((asint(({0}) << 16) >> 16) %s (asint(({1}) << 16) >> 16), -32768, 32767)) & 0xffffu)' % op
+            elif is_sub:
+                expr = '(({0}) > ({1}) ? (({0}) - ({1})) : 0u)'
+            else:
+                expr = 'min(({0}) + ({1}), 0xffffu)'
+        else:
+            op = '-' if is_sub else '+'
+            expr = '((({0}) %s ({1})) & 0xffffu)' % op
+        self.packed_half(base, 2, expr, ops, rest_mods, select_bits=True)
+
+    def op_v_pk_add_i16(self, ops, mods):
+        self._packed_add_sub_16('v_pk_add_i16', True, False, ops, mods)
+
+    def op_v_pk_sub_i16(self, ops, mods):
+        self._packed_add_sub_16('v_pk_sub_i16', True, True, ops, mods)
+
+    def op_v_pk_add_u16(self, ops, mods):
+        self._packed_add_sub_16('v_pk_add_u16', False, False, ops, mods)
+
+    def op_v_pk_sub_u16(self, ops, mods):
+        self._packed_add_sub_16('v_pk_sub_u16', False, True, ops, mods)
+
     def op_v_ldexp_f32(self, ops, mods):
         if len(ops) != 3:
             raise Unsupported('v_ldexp_f32 with %d operands, expected 3' % len(ops))
