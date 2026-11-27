@@ -1582,6 +1582,43 @@ struct DirectCompute {
             write_ballot(i.dst, condition);
             return;
         }
+        if (compute && (n == "v_pk_add_i16" || n == "v_pk_sub_i16" ||
+                        n == "v_pk_add_u16" || n == "v_pk_sub_u16")) {
+            // Two-source VOP3P packed 16-bit add/sub accept op_sel[1:0], op_sel_hi[1:0]
+            // and clamp (ignoring LLVM's default op_sel_hi[2] bit 14) and refuse neg and reserved bits.
+            if (i.enc != Encoding::Mix || (i.a & 0x2700) || (i.b >> 29) || i.src[2])
+                refuse(i.pc, "unsupported packed 16-bit add/sub operand modifiers");
+            const bool sign = n == "v_pk_add_i16" || n == "v_pk_sub_i16";
+            const bool sub = n == "v_pk_sub_i16" || n == "v_pk_sub_u16";
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]);
+            auto half = [&](const string &word, bool hi, bool sext) {
+                if (sext)
+                    return hi ? ir.binary("ashr", word, "16")
+                              : ir.binary("ashr", ir.binary("shl", word, "16"), "16");
+                return hi ? ir.binary("lshr", word, "16") : ir.binary("and", word, "65535");
+            };
+            auto lane = [&](bool hi_out) {
+                const bool sel_a = hi_out ? ((i.b >> 27) & 1) != 0 : ((i.a >> 11) & 1) != 0;
+                const bool sel_b = hi_out ? ((i.b >> 28) & 1) != 0 : ((i.a >> 12) & 1) != 0;
+                auto x = half(a, sel_a, i.clamp && sign);
+                auto y = half(b, sel_b, i.clamp && sign);
+                auto res = ir.binary(sub ? "sub" : "add", x, y);
+                if (i.clamp) {
+                    if (sign) {
+                        res = select(cmp("sgt", res, "32767"), "32767", res);
+                        res = select(cmp("slt", res, "-32768"), "-32768", res);
+                    } else if (sub) {
+                        res = select(cmp("ugt", x, y), res, "0");
+                    } else {
+                        res = select(cmp("ugt", res, "65535"), "65535", res);
+                    }
+                }
+                return ir.binary("and", res, "65535");
+            };
+            auto lo = lane(false), hi = lane(true);
+            vector_write(i.dst, ir.binary("or", lo, ir.binary("shl", hi, "16")));
+            return;
+        }
         if (compute && (n == "v_dot2_i32_i16" || n == "v_dot2_u32_u16")) {
             // These VOP3P dot forms consume both halfwords as-is.
             if (i.enc != Encoding::Mix || (i.a & 0x7f00) != 0x4000 || (i.b >> 27) != 3)
