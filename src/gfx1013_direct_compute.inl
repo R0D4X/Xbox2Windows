@@ -1522,6 +1522,43 @@ struct DirectCompute {
             vector_write(i.dst, sum);
             return;
         }
+        if (compute && (n == "v_pk_mul_lo_u16" || n == "v_pk_mad_u16" || n == "v_pk_mad_i16")) {
+            const bool mad = n != "v_pk_mul_lo_u16";
+            const bool sign = n == "v_pk_mad_i16";
+            if (i.enc != Encoding::Mix || (i.a & 0x0700) || (i.b >> 29) ||
+                (!mad && (i.clamp || (i.a & 0x2000) || i.src[2])))
+                refuse(i.pc, "unsupported packed 16-bit mul/mad operand modifiers");
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]);
+            string c = mad ? operand32(i, i.src[2]) : string();
+            auto half = [&](const string &word, bool hi, bool sext) {
+                if (sext)
+                    return hi ? ir.binary("ashr", word, "16")
+                              : ir.binary("ashr", ir.binary("shl", word, "16"), "16");
+                return hi ? ir.binary("lshr", word, "16") : ir.binary("and", word, "65535");
+            };
+            auto lane = [&](bool hi_out) {
+                const bool sel_a = hi_out ? ((i.b >> 27) & 1) != 0 : ((i.a >> 11) & 1) != 0;
+                const bool sel_b = hi_out ? ((i.b >> 28) & 1) != 0 : ((i.a >> 12) & 1) != 0;
+                const bool sel_c = hi_out ? ((i.a >> 14) & 1) != 0 : ((i.a >> 13) & 1) != 0;
+                const bool sext = i.clamp && sign;
+                auto res = ir.binary("mul", half(a, sel_a, sext), half(b, sel_b, sext));
+                if (mad) {
+                    res = ir.binary("add", res, half(c, sel_c, sext));
+                    if (i.clamp) {
+                        if (sign) {
+                            res = select(cmp("sgt", res, "32767"), "32767", res);
+                            res = select(cmp("slt", res, "-32768"), "-32768", res);
+                        } else {
+                            res = select(cmp("ugt", res, "65535"), "65535", res);
+                        }
+                    }
+                }
+                return ir.binary("and", res, "65535");
+            };
+            auto lo = lane(false), hi = lane(true);
+            vector_write(i.dst, ir.binary("or", lo, ir.binary("shl", hi, "16")));
+            return;
+        }
         if (auto dst = carry_destination(i)) {
             if (pixel_stage || (graphics_input && ir.loop_dependencies) || i.subword || i.dpp_control || i.clamp || i.neg || i.scale)
                 refuse(i.pc, "unsupported carry instruction stage or operand modifiers");
