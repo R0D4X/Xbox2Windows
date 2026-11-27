@@ -1552,7 +1552,7 @@ struct DirectCompute {
                 const bool uncertain_scalar = (inst.enc == Encoding::Sopk && n != "s_movk_i32") ||
                     (inst.enc == Encoding::Sop2 && !overwrites && !preserves_pair) ||
                     (inst.enc == Encoding::Sop1 && !overwrites && n != "s_mov_b32" && n != "s_mov_b64" &&
-                     n != "s_brev_b64");
+                     n != "s_brev_b64" && n != "s_sext_i32_i8" && n != "s_sext_i32_i16");
                 if (reads_scc || uncertain_scalar || (inst.branch() && (inst.op == 4 || inst.op == 5))) {
                     scc_live[j] = true;
                     pending.push_back(j);
@@ -2247,7 +2247,11 @@ struct DirectCompute {
             }
         } else if (n == "s_abs_i32")
             z = select(cmp("slt", a, "0"), ir.binary("sub", "0", a), a);
-        else if (n == "v_add_nc_u32" || n == "s_add_u32")
+        else if (n == "s_sext_i32_i8" || n == "s_sext_i32_i16") {
+            const char *bits = n == "s_sext_i32_i8" ? "24" : "16";
+            write(i.dst, ir.binary("ashr", ir.binary("shl", a, bits), bits));
+            return;
+        } else if (n == "v_add_nc_u32" || n == "s_add_u32")
             z = ir.binary("add", a, b);
         else if (n == "s_sub_u32" || n == "v_sub_nc_u32")
             z = ir.binary("sub", a, b);
