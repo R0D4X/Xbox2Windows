@@ -2065,10 +2065,35 @@ struct DirectCompute {
             z = ir.binary(op, ir.binary(op, a, b), val(2));
         } else if (n == "v_add_lshl_u32")
             z = shift("shl", ir.binary("add", a, b), val(2));
-        else if (n == "v_mad_i32_i24") {
-            // sext(S0[23:0]) * sext(S1[23:0]) + S2 modulo 2^32 (#2991, gfx2hlsl.py's VOP3 table).
+        else if (n == "v_mul_i32_i24" || n == "v_mad_i32_i24") {
+            if (n == "v_mul_i32_i24" && i.wide && i.src[2] != 0)
+                refuse(i.pc, "v_mul_i32_i24 with unused src2 field set");
+            if (n == "v_mul_i32_i24" && i.wide && (i.a & 0x7800))
+                refuse(i.pc, "v_mul_i32_i24 with op_sel");
+            // sext(S0[23:0]) * sext(S1[23:0]) (+ S2) modulo 2^32.
             auto sext24 = [&](const string &x) { return ir.binary("ashr", ir.binary("shl", x, "8"), "8"); };
-            z = ir.binary("add", ir.binary("mul", sext24(a), sext24(b)), val(2));
+            z = ir.binary("mul", sext24(a), sext24(b));
+            if (n == "v_mad_i32_i24")
+                z = ir.binary("add", z, val(2));
+        } else if (n == "v_mul_hi_i32_i24" || n == "v_mul_hi_u32_u24") {
+            if (i.wide && i.src[2] != 0)
+                refuse(i.pc, string(n) + " with unused src2 field set");
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, string(n) + " with op_sel");
+            const bool sign = n == "v_mul_hi_i32_i24";
+            // Split each 24-bit operand as top * 2^12 + low (low in 0..4095, top signed or unsigned 12-bit).
+            // All intermediates stay inside 32 bits; floor division nests exactly for both signs.
+            auto top = [&](const string &x) {
+                return sign ? ir.binary("ashr", ir.binary("shl", x, "8"), "20")
+                            : ir.binary("and", ir.binary("lshr", x, "12"), "4095");
+            };
+            auto low = [&](const string &x) { return ir.binary("and", x, "4095"); };
+            auto ah = top(a), al = low(a), bh = top(b), bl = low(b);
+            auto hh = ir.binary("mul", ah, bh);
+            auto mid = ir.binary("add", ir.binary("mul", ah, bl), ir.binary("mul", al, bh));
+            auto t = ir.binary("add", mid, ir.binary("lshr", ir.binary("mul", al, bl), "12"));
+            const char *rshift = sign ? "ashr" : "lshr";
+            z = ir.binary(rshift, ir.binary("add", hh, ir.binary(rshift, t, "12")), "8");
         } else if (n == "v_mul_u32_u24" || n == "v_mad_u32_u24") {
             z = ir.binary("mul", ir.binary("and", a, "16777215"), ir.binary("and", b, "16777215"));
             if (n == "v_mad_u32_u24")
