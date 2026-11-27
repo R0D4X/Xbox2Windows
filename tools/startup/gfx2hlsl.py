@@ -9391,6 +9391,22 @@ class Stage:
     def op_v_pk_min_f16(self, ops, mods):
         self.packed_half('v_pk_min_f16', 2, 'minmax16_bits({0}, {1}, false)', ops, mods, select_bits=True)
 
+    def op_v_pk_max_u16(self, ops, mods):
+        self.packed_half('v_pk_max_u16', 2, 'max({0}, {1})', ops, mods, select_bits=True)
+
+    def op_v_pk_min_u16(self, ops, mods):
+        self.packed_half('v_pk_min_u16', 2, 'min({0}, {1})', ops, mods, select_bits=True)
+
+    def op_v_pk_max_i16(self, ops, mods):
+        self.packed_half('v_pk_max_i16', 2,
+                         '(asuint(max(asint(({0}) << 16) >> 16, asint(({1}) << 16) >> 16)) & 0xffffu)',
+                         ops, mods, select_bits=True)
+
+    def op_v_pk_min_i16(self, ops, mods):
+        self.packed_half('v_pk_min_i16', 2,
+                         '(asuint(min(asint(({0}) << 16) >> 16, asint(({1}) << 16) >> 16)) & 0xffffu)',
+                         ops, mods, select_bits=True)
+
     def cube(self, kind, ops, mods):
         """v_cube{id,sc,tc,ma}_f32: LLVM's ConstantFoldAMDGCNCubeIntrinsic.
 
