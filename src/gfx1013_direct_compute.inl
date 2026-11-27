@@ -2189,6 +2189,8 @@ struct DirectCompute {
             z = ir.binary("or", a, b);
         else if (n == "v_xor_b32" || n == "s_xor_b32")
             z = ir.binary("xor", a, b);
+        else if (n == "v_xnor_b32")
+            z = ir.binary("xor", ir.binary("xor", a, b), "4294967295");
         else if (n == "v_and_or_b32")
             z = ir.binary("or", ir.binary("and", a, b), val(2));
         else if (n == "v_xad_u32")

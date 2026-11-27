@@ -276,7 +276,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             static const std::set<Name> bits{
                 "v_mov_b32", "v_not_b32", "v_cndmask_b32", "v_bfrev_b32", "v_mul_u32_u24",
                 "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32",
-                "v_and_b32", "v_or_b32", "v_xor_b32", "v_min_u32", "v_max_u32",
+                "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_min_u32", "v_max_u32",
                 "v_min_i32", "v_max_i32", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32"};
             static const std::set<Name> floats{
                 "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_min_f32", "v_max_f32",
