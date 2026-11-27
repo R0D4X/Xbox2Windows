@@ -1605,8 +1605,8 @@ struct DirectCompute {
                 auto res = ir.binary(sub ? "sub" : "add", x, y);
                 if (i.clamp) {
                     if (sign) {
-                        res = select(cmp("sgt", res, "32767"), "32767", res);
-                        res = select(cmp("slt", res, "-32768"), "-32768", res);
+                        auto low = select(cmp("slt", res, "-32768"), "32768", ir.binary("and", res, "65535"));
+                        return select(cmp("sgt", res, "32767"), "32767", low);
                     } else if (sub) {
                         res = select(cmp("ugt", x, y), res, "0");
                     } else {
