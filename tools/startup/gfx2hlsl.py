@@ -506,6 +506,10 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('%s with neg/abs on exponent or unused source' % name)
         if (word1 >> 18) & 0x1ff:
             raise Unsupported('%s with unused src2 field set' % name)
+    if name == 'v_mad_i32_i16':
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if word0 & 0x700 or word1 & 0xe0000000:
+            raise Unsupported('%s with neg/abs' % name)
     if name == 'v_cvt_off_f32_i4_e64':
         # Integer-nibble conversion: the instruction has one source, so only src0's VOP3A ABS (w0[8]) and NEG
         # (w1[29]) can carry a modifier. Masking all three bit positions of each field (w0[10:8], w1[31:29])
@@ -2656,7 +2660,7 @@ class Stage:
             return (self.operand_align4(srcs[0]) or ((self.const_u32(srcs[1]) or 0) & 31) >= 2) and self.operand_align4(srcs[2])
         if base == 'v_add_lshl_u32':
             return ((self.const_u32(srcs[2]) or 0) & 31) >= 2 or (self.operand_align4(srcs[0]) and self.operand_align4(srcs[1]))
-        if base in ('v_and_or_b32', 'v_mad_u32_u24', 'v_mad_i32_i24', 'v_mad_u32_u16'):
+        if base in ('v_and_or_b32', 'v_mad_u32_u24', 'v_mad_i32_i24', 'v_mad_u32_u16', 'v_mad_i32_i16'):
             return (self.operand_align4(srcs[0]) or self.operand_align4(srcs[1])) and self.operand_align4(srcs[2])
         return False
 
@@ -5023,7 +5027,7 @@ class Stage:
                 c0, c1 = self.const_u32(ops[1]), self.const_u32(ops[2])
                 args = [self.u(ops[1], low16_only=c1 is not None and (c1 & 0xffff0000) == 0),
                         self.u(ops[2], low16_only=c0 is not None and (c0 & 0xffff0000) == 0)]
-            elif base == 'v_mad_u32_u16':
+            elif base in ('v_mad_u32_u16', 'v_mad_i32_i16'):
                 # S0 and S1 read only bits [15:0]; S2 reads all 32 bits.
                 args = [self.u(ops[1], low16_only=True),
                         self.u(ops[2], low16_only=True),
@@ -10414,6 +10418,7 @@ VEC_U = {
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
     'v_mad_i32_i24': (3, 'asuint(asint({0} << 8) >> 8) * asuint(asint({1} << 8) >> 8) + {2}'),
     'v_mad_u32_u16': (3, '({0} & 0xffffu) * ({1} & 0xffffu) + {2}'),
+    'v_mad_i32_i16': (3, 'asuint(asint({0} << 16) >> 16) * asuint(asint({1} << 16) >> 16) + {2}'),
     'v_lshl_add_u32': (3, '({0} << ({1} & 31)) + {2}'), 'v_add_lshl_u32': (3, '({0} + {1}) << ({2} & 31)'), 'v_add3_u32': (3, '{0} + {1} + {2}'),
     'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_xor3_b32': (3, '{0} ^ {1} ^ {2}'), 'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),
     'v_xad_u32': (3, '({0} ^ {1}) + {2}'), 'v_bfi_b32': (3, '({0} & {1}) | (~{0} & {2})'),
