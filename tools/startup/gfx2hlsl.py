@@ -9328,6 +9328,31 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, 'hi')
 
+    def op_v_pk_mul_lo_u16(self, ops, mods):
+        self.packed_half('v_pk_mul_lo_u16', 2, '((({0}) * ({1})) & 0xffffu)',
+                         ops, mods, select_bits=True)
+
+    def _packed_mad_16(self, base, signed, ops, mods):
+        clamp_count = sum(1 for m in mods if m == 'clamp')
+        if clamp_count > 1:
+            raise Unsupported('%s with duplicate clamp' % base)
+        rest_mods = [m for m in mods if m != 'clamp']
+        if clamp_count:
+            if signed:
+                expr = ('(asuint(clamp((asint(({0}) << 16) >> 16) * (asint(({1}) << 16) >> 16) '
+                        '+ (asint(({2}) << 16) >> 16), -32768, 32767)) & 0xffffu)')
+            else:
+                expr = 'min((({0}) * ({1}) + ({2})), 0xffffu)'
+        else:
+            expr = '((({0}) * ({1}) + ({2})) & 0xffffu)'
+        self.packed_half(base, 3, expr, ops, rest_mods, select_bits=True)
+
+    def op_v_pk_mad_u16(self, ops, mods):
+        self._packed_mad_16('v_pk_mad_u16', False, ops, mods)
+
+    def op_v_pk_mad_i16(self, ops, mods):
+        self._packed_mad_16('v_pk_mad_i16', True, ops, mods)
+
     def packed_half(self, base, arity, text, ops, mods, *, select_bits=False):
         """Apply the same binary16 operation to each of two selected halves.
 
