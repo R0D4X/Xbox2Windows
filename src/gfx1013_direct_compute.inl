@@ -1537,6 +1537,7 @@ struct DirectCompute {
                 // SRC_SCC operand still takes precedence below.
                 const bool mask_scc = n == "s_andn2_b64" || n == "s_and_b64" || n == "s_or_b64" ||
                     n == "s_xor_b64" || n == "s_not_b64" || n == "s_wqm_b32" || n == "s_wqm_b64" ||
+                    n == "s_quadmask_b32" || n == "s_quadmask_b64" ||
                     n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64";
                 const bool overwrites = mask_scc || inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
                     n == "s_or_b32" || n == "s_max_u32" || n == "s_add_u32" || n == "s_sub_u32" ||
@@ -2034,6 +2035,39 @@ struct DirectCompute {
             write(i.dst, out_lo);
             write(i.dst + 1, out_hi);
             write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", out_lo, out_hi), "0") + " to i32"));
+            return;
+        }
+        if (compute && (n == "s_quadmask_b32" || n == "s_quadmask_b64")) {
+            auto quadmask32 = [&](const string &x) {
+                auto t = ir.binary("or", x, ir.binary("lshr", x, "2"));
+                t = ir.binary("and", ir.binary("or", t, ir.binary("lshr", t, "1")), "286331153");
+                t = ir.binary("and", ir.binary("or", t, ir.binary("lshr", t, "3")), "50529027");
+                t = ir.binary("and", ir.binary("or", t, ir.binary("lshr", t, "6")), "983055");
+                return ir.binary("and", ir.binary("or", t, ir.binary("lshr", t, "12")), "255");
+            };
+            if (n == "s_quadmask_b32") {
+                auto q = quadmask32(operand32(i, i.src[0]));
+                write(i.dst, q);
+                write(128, ir.value("zext i1 " + cmp("ne", q, "0") + " to i32"));
+                return;
+            }
+            if ((i.dst & 1) || i.dst > 104)
+                refuse(i.pc, "invalid s_quadmask_b64 destination");
+            const unsigned s0 = i.src[0];
+            const bool s0_pair = s0 <= 104 && !(s0 & 1);
+            const bool s0_int = s0 >= 128 && s0 <= 208;
+            if (!(s0_pair || s0 == 125 || s0_int || s0 == 255))
+                refuse(i.pc, "invalid s_quadmask_b64 source");
+            auto lo = s0 == 125 ? "0" : operand32(i, s0);
+            string hi = "0";
+            if (s0_pair)
+                hi = operand32(i, s0 + 1);
+            else if (s0 >= 193 && s0 <= 208)
+                hi = "4294967295";
+            auto out_lo = ir.binary("or", quadmask32(lo), ir.binary("shl", quadmask32(hi), "8"));
+            write(i.dst, out_lo);
+            write(i.dst + 1, "0");
+            write(128, ir.value("zext i1 " + cmp("ne", out_lo, "0") + " to i32"));
             return;
         }
         if (compute && (n == "s_brev_b64" || n == "s_bfe_u64" || n == "s_bfe_i64")) {
