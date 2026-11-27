@@ -1563,6 +1563,30 @@ struct DirectCompute {
             vector_write(i.dst, sum);
             return;
         }
+        if (compute && (n == "v_pk_lshlrev_b16" || n == "v_pk_lshrrev_b16" || n == "v_pk_ashrrev_i16")) {
+            // Two-source VOP3P packed 16-bit shifts accept op_sel[1:0] and op_sel_hi[1:0]
+            // (ignoring LLVM's default op_sel_hi[2] bit 14) and refuse clamp, neg and reserved bits.
+            if (i.enc != Encoding::Mix || i.clamp || (i.a & 0x2700) || (i.b >> 29) || i.src[2])
+                refuse(i.pc, "unsupported packed 16-bit shift operand modifiers");
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]);
+            auto lane = [&](bool hi_out) {
+                const bool sel_a = hi_out ? ((i.b >> 27) & 1) != 0 : ((i.a >> 11) & 1) != 0;
+                const bool sel_b = hi_out ? ((i.b >> 28) & 1) != 0 : ((i.a >> 12) & 1) != 0;
+                auto amt = ir.binary("and", sel_a ? ir.binary("lshr", a, "16") : a, "15");
+                if (n == "v_pk_ashrrev_i16") {
+                    auto aligned = sel_b ? b : ir.binary("shl", b, "16");
+                    auto shift = ir.binary("add", amt, "16");
+                    return ir.binary("and", ir.binary("ashr", aligned, shift), "65535");
+                }
+                auto val = sel_b ? ir.binary("lshr", b, "16") : ir.binary("and", b, "65535");
+                if (n == "v_pk_lshrrev_b16")
+                    return ir.binary("lshr", val, amt);
+                return ir.binary("and", ir.binary("shl", val, amt), "65535");
+            };
+            auto lo = lane(false), hi = lane(true);
+            vector_write(i.dst, ir.binary("or", lo, ir.binary("shl", hi, "16")));
+            return;
+        }
         const bool select_mods = n == "v_cndmask_b32" && i.wide && !((i.abs | i.neg) & 4);
         if ((i.subword && i.enc != Encoding::Vop1 && i.enc != Encoding::Vop2) || ((i.abs || i.neg) && !select_mods) || i.clamp || i.scale)
             refuse(i.pc, "direct ALU operand modifiers");
