@@ -9424,6 +9424,19 @@ class Stage:
         }[kind]
         self.set_vf(dst[1], expression, mods)
 
+    def op_v_pk_lshlrev_b16(self, ops, mods):
+        self.packed_half('v_pk_lshlrev_b16', 2, '((({1}) << (({0}) & 15u)) & 0xffffu)',
+                         ops, mods, select_bits=True)
+
+    def op_v_pk_lshrrev_b16(self, ops, mods):
+        self.packed_half('v_pk_lshrrev_b16', 2, '(({1}) >> (({0}) & 15u))',
+                         ops, mods, select_bits=True)
+
+    def op_v_pk_ashrrev_i16(self, ops, mods):
+        self.packed_half('v_pk_ashrrev_i16', 2,
+                         '(asuint(asint(({1}) << 16) >> (16u + (({0}) & 15u))) & 0xffffu)',
+                         ops, mods, select_bits=True)
+
     def op_v_cubeid_f32(self, ops, mods):
         self.cube('id', ops, mods)
 
