@@ -1495,7 +1495,6 @@ struct DirectCompute {
             auto mag1 = ir.binary("and", s1, "32767");
             auto mag2 = ir.binary("and", s2, "32767");
             auto sign_out = ir.binary("and", ir.binary("xor", s1, s2), "32768");
-            auto s0_nan = cmp("ugt", mag0, "31744");
             auto s1_nan = cmp("ugt", mag1, "31744");
             auto s2_nan = cmp("ugt", mag2, "31744");
             auto s1_inf = cmp("eq", mag1, "31744");
@@ -1507,12 +1506,14 @@ struct DirectCompute {
                                     ir.value("and i1 " + s1_inf + ", " + s2_inf));
             auto to_inf = ir.value("or i1 " + s1_zero + ", " + s2_inf);
             auto to_zero = ir.value("or i1 " + s1_inf + ", " + s2_zero);
-            string result = select(s0_nan, signed_inf, ir.binary("or", sign_out, mag0));
+            // RDNA 2 ISA V_DIV_FIXUP_F16 (section 12.12, opcode 863): S2 NaN takes priority over S1 NaN,
+            // 0/0 and Inf/Inf yield 0xfe00, and the default path sets the sign of S0 to sign(S1) ^ sign(S2).
+            string result = ir.binary("or", sign_out, mag0);
             result = select(to_zero, sign_out, result);
             result = select(to_inf, signed_inf, result);
-            result = select(invalid, "32256", result);
-            result = select(s2_nan, ir.binary("or", s2, "512"), result);
+            result = select(invalid, "65024", result);
             result = select(s1_nan, ir.binary("or", s1, "512"), result);
+            result = select(s2_nan, ir.binary("or", s2, "512"), result);
             if (i.clamp) {
                 auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
                 auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));

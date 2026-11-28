@@ -1,4 +1,4 @@
-"""Direct compute VOP3 v_div_fixup_f16 (exact IEEE-754 binary16 division fixup, high-half preserving)."""
+"""Direct compute VOP3 v_div_fixup_f16 (RDNA 2 ISA section 12.12, opcode 863, high-half preserving)."""
 from pathlib import Path
 import struct
 import subprocess
@@ -11,16 +11,19 @@ MASK = 0xFFFFFFFF
 SENTINEL = 0x69696969
 HIGH_SEED = 0xBEEF0000
 
-# (S0=quotient, S1=denominator, S2=numerator) with optional upper junk
+# 10 cases x 3 ops = 30 words/lane (+ 2 sentinel words/lane = 32 words/lane).
+# Each tuple: (S0=quotient, S1=denominator, S2=numerator) with optional upper junk.
 CASES = (
     (0xCAFE3800, 0x1234C000, 0x56783C00),  # Q=+0.5h, D=-2.0h, N=+1.0h -> -0.5h
-    (0x0000BA00, 0x0000C400, 0x0000C200),  # Q=-0.75h, D=-4.0h, N=-3.0h -> +0.75h
     (0x00003C00, 0x00008000, 0x00003C00),  # D=-0.0h, N=+1.0h -> -Inf
     (0x00003C00, 0x00007C00, 0x0000BC00),  # D=+Inf, N=-1.0h -> -0.0h
-    (0x00003C00, 0x00008000, 0x00000000),  # 0/0 -> qNaN (0x7E00)
-    (0x00003C00, 0x0000FC00, 0x00007C00),  # Inf/Inf -> qNaN (0x7E00)
-    (0x00007E01, 0x0000C000, 0x00003C00),  # Q=NaN (overflow), D=-2.0h, N=+1.0h -> -Inf
-    (0x00003C00, 0x00007C01, 0x00003C00),  # D=sNaN -> quiet(D) (0x7E01)
+    (0x00003C00, 0x00008000, 0x00000000),  # 0/0 -> 0xFE00
+    (0x00003C00, 0x0000FC00, 0x00007C00),  # Inf/Inf -> 0xFE00
+    (0x00007E01, 0x0000C000, 0x00003C00),  # Q=NaN, D=-2.0h, N=+1.0h -> sign_out | abs(Q) = 0xFE01
+    (0x00003C00, 0x00007C01, 0x00003C00),  # S1=sNaN alone -> Quiet(S1) = 0x7E01
+    (0x00003C00, 0x00003C00, 0x00007C02),  # S2=sNaN alone -> Quiet(S2) = 0x7E02
+    (0x00003C00, 0x00007C01, 0x00007C02),  # S1=sNaN and S2=sNaN -> Quiet(S2) = 0x7E02 wins
+    (0x0000BA00, 0x0000C400, 0x0000C200),  # Q=-0.75h, D=-4.0h, N=-3.0h -> +0.75h (clamped stays 0.75h)
 )
 
 
@@ -43,37 +46,43 @@ def program():
         code += v_mov_lit(1, s0) + v_mov_lit(2, s1) + v_mov_lit(3, s2)
         # 0: plain v_div_fixup_f16 v4, v1, v2, v3
         code += v_mov_lit(4, HIGH_SEED | 0x1111) + vop3_ternary(0x35F, 4, 257, 258, 259) + [
-            0xE0701000 | (4 * (ci * 4 + 0)), 0x80080408]
-        # 1: inline float 0.5 (src0=240 -> 0x3800) + negated denominator
-        code += v_mov_lit(4, HIGH_SEED | 0x2222) + vop3_ternary(0x35F, 4, 240, 258, 259, neg_m=2) + [
-            0xE0701000 | (4 * (ci * 4 + 1)), 0x80080408]
-        # 2: abs denominator: v_div_fixup_f16 v4, v1, |v2|, v3
-        code += v_mov_lit(4, HIGH_SEED | 0x3333) + vop3_ternary(0x35F, 4, 257, 258, 259, abs_m=2) + [
-            0xE0701000 | (4 * (ci * 4 + 2)), 0x80080408]
-        # 3: clamped: v_div_fixup_f16 v4, v1, v2, v3 clamp
-        code += v_mov_lit(4, HIGH_SEED | 0x4444) + vop3_ternary(0x35F, 4, 257, 258, 259, clamp=1) + [
-            0xE0701000 | (4 * (ci * 4 + 3)), 0x80080408]
+            0xE0701000 | (4 * (ci * 3 + 0)), 0x80080408]
+        # 1: inline float 0.5 (src0=240 -> 0x3800) + -|v2|
+        code += v_mov_lit(4, HIGH_SEED | 0x2222) + vop3_ternary(0x35F, 4, 240, 258, 259, abs_m=2, neg_m=2) + [
+            0xE0701000 | (4 * (ci * 3 + 1)), 0x80080408]
+        # 2: clamped: v_div_fixup_f16 v4, v1, v2, v3 clamp
+        code += v_mov_lit(4, HIGH_SEED | 0x3333) + vop3_ternary(0x35F, 4, 257, 258, 259, clamp=1) + [
+            0xE0701000 | (4 * (ci * 3 + 2)), 0x80080408]
     return code + [0xBF810000]
 
 
-def div_fixup_f16(s0, s1, s2, *, clamp=False, ignore_sign_xor=False, ignore_invalid=False, ignore_q_nan=False):
+def div_fixup_f16(s0, s1, s2, *, clamp=False, ignore_sign_xor=False, ignore_invalid=False, swap_nan_priority=False):
     s0, s1, s2 = s0 & 0xFFFF, s1 & 0xFFFF, s2 & 0xFFFF
     m0, m1, m2 = s0 & 0x7FFF, s1 & 0x7FFF, s2 & 0x7FFF
     sign_out = (s0 & 0x8000) if ignore_sign_xor else ((s1 ^ s2) & 0x8000)
-    if m1 > 0x7C00:
-        res = s1 | 0x0200
-    elif m2 > 0x7C00:
-        res = s2 | 0x0200
-    elif (not ignore_invalid) and ((m1 == 0 and m2 == 0) or (m1 == 0x7C00 and m2 == 0x7C00)):
-        res = 0x7E00
-    elif m1 == 0 or m2 == 0x7C00:
-        res = sign_out | 0x7C00
-    elif m1 == 0x7C00 or m2 == 0:
-        res = sign_out
-    elif (not ignore_q_nan) and m0 > 0x7C00:
-        res = sign_out | 0x7C00
+    if swap_nan_priority:
+        if m1 > 0x7C00:
+            res = s1 | 0x0200
+        elif m2 > 0x7C00:
+            res = s2 | 0x0200
+        else:
+            res = None
     else:
-        res = sign_out | m0
+        if m2 > 0x7C00:
+            res = s2 | 0x0200
+        elif m1 > 0x7C00:
+            res = s1 | 0x0200
+        else:
+            res = None
+    if res is None:
+        if (not ignore_invalid) and ((m1 == 0 and m2 == 0) or (m1 == 0x7C00 and m2 == 0x7C00)):
+            res = 0xFE00
+        elif m1 == 0 or m2 == 0x7C00:
+            res = sign_out | 0x7C00
+        elif m1 == 0x7C00 or m2 == 0:
+            res = sign_out
+        else:
+            res = sign_out | m0
     if clamp:
         if (res & 0x7FFF) > 0x7C00 or (res & 0x8000):
             res = 0
@@ -82,23 +91,21 @@ def div_fixup_f16(s0, s1, s2, *, clamp=False, ignore_sign_xor=False, ignore_inva
     return res & 0xFFFF
 
 
-def reference(*, ignore_sign_xor=False, ignore_invalid=False, ignore_q_nan=False,
+def reference(*, ignore_sign_xor=False, ignore_invalid=False, swap_nan_priority=False,
               no_clamp=False, inline_as_zero=False, zero_high=False):
     hi = 0 if zero_high else HIGH_SEED
-    words = [SENTINEL] * 8
-    for _lane in range(64):
-        for s0, s1, s2 in CASES:
-            r0 = div_fixup_f16(s0, s1, s2, ignore_sign_xor=ignore_sign_xor,
-                               ignore_invalid=ignore_invalid, ignore_q_nan=ignore_q_nan)
-            r_inl = div_fixup_f16(0x0000 if inline_as_zero else 0x3800, (s1 & 0xFFFF) ^ 0x8000, s2,
-                                  ignore_sign_xor=ignore_sign_xor, ignore_invalid=ignore_invalid,
-                                  ignore_q_nan=ignore_q_nan)
-            r_abs = div_fixup_f16(s0, s1 & 0x7FFF, s2, ignore_sign_xor=ignore_sign_xor,
-                                  ignore_invalid=ignore_invalid, ignore_q_nan=ignore_q_nan)
-            r_clamp = div_fixup_f16(s0, s1, s2, clamp=not no_clamp, ignore_sign_xor=ignore_sign_xor,
-                                    ignore_invalid=ignore_invalid, ignore_q_nan=ignore_q_nan)
-            words.extend((hi | r0, hi | r_inl, hi | r_abs, hi | r_clamp))
-    return words + [SENTINEL] * 8
+    lane = []
+    for s0, s1, s2 in CASES:
+        r0 = div_fixup_f16(s0, s1, s2, ignore_sign_xor=ignore_sign_xor, ignore_invalid=ignore_invalid,
+                           swap_nan_priority=swap_nan_priority)
+        r_inl = div_fixup_f16(0x0000 if inline_as_zero else 0x3800, (s1 & 0x7FFF) ^ 0x8000, s2,
+                              ignore_sign_xor=ignore_sign_xor, ignore_invalid=ignore_invalid,
+                              swap_nan_priority=swap_nan_priority)
+        r_clamp = div_fixup_f16(s0, s1, s2, clamp=not no_clamp, ignore_sign_xor=ignore_sign_xor,
+                                ignore_invalid=ignore_invalid, swap_nan_priority=swap_nan_priority)
+        lane.extend((hi | r0, hi | r_inl, hi | r_clamp))
+    lane.extend([SENTINEL] * (32 - len(lane)))
+    return [SENTINEL] * 8 + lane * 64 + [SENTINEL] * 8
 
 
 def controls(cli, sdk, work, root):
@@ -109,7 +116,7 @@ def controls(cli, sdk, work, root):
     assert result.returncode == 0 and output.is_file(), (result.stdout, result.stderr)
     dump = subprocess.run([Path(sdk) / 'dxc.exe', '-dumpbin', output], capture_output=True,
                           text=True, check=True).stdout
-    assert '31744' in dump and '32256' in dump and '14336' in dump, dump
+    assert '31744' in dump and '65024' in dump and '14336' in dump, dump
     for tag, bad in (
         ('omod', vop3_ternary(0x35F, 4, 257, 258, 259, omod=1) + [0xBF810000]),
         ('op_sel', vop3_ternary(0x35F, 4, 257, 258, 259, op_sel=1) + [0xBF810000]),
@@ -121,13 +128,14 @@ def controls(cli, sdk, work, root):
                                   bad_marker.with_suffix('.cso')], capture_output=True, text=True)
         assert bad_res.returncode != 0 and 'unsupported v_div_fixup_f16 operand modifiers' in (
             bad_res.stdout + bad_res.stderr), (tag, bad_res.stdout, bad_res.stderr)
-    assert reference() != reference(ignore_sign_xor=True)
-    assert reference() != reference(ignore_invalid=True)
-    assert reference() != reference(ignore_q_nan=True)
-    assert reference() != reference(no_clamp=True)
-    assert reference() != reference(inline_as_zero=True)
-    assert reference() != reference(zero_high=True)
-    print('v_div_fixup_f16 DXIL verified; invalid modifiers refused; sign, invalid, q-NaN, clamp, inline and high-half controls differ')
+    expected = reference()
+    assert expected != reference(ignore_sign_xor=True)
+    assert expected != reference(ignore_invalid=True)
+    assert expected != reference(swap_nan_priority=True)
+    assert expected != reference(no_clamp=True)
+    assert expected != reference(inline_as_zero=True)
+    assert expected != reference(zero_high=True)
+    print('v_div_fixup_f16 DXIL verified; invalid modifiers refused; sign, invalid, NaN-priority, clamp, inline and high-half controls differ')
     return 0
 
 
@@ -143,7 +151,7 @@ def hardware(replay, sdk, work, root):
     mismatch = next((i for i, (a, e) in enumerate(zip(actual, expected)) if a != e), None)
     if mismatch is not None:
         raise AssertionError(f'word {mismatch}: got {actual[mismatch]:08x}, expected {expected[mismatch]:08x}')
-    print('v_div_fixup_f16: 2048 result words (high halves kept) and 16 guards matched')
+    print(f'v_div_fixup_f16: all {len(expected)} words (high halves and guards kept) matched')
     return 0
 
 
