@@ -1504,8 +1504,6 @@ struct DirectCompute {
             return true;
         }
         if (n == "v_floor_f16" || n == "v_ceil_f16" || n == "v_trunc_f16" || n == "v_rndne_f16") {
-            if (graphics_input)
-                return false;
             if (i.subword || i.dpp_control || permuted || i.scale ||
                 (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 6) || i.src[1] || i.src[2])))
                 refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
