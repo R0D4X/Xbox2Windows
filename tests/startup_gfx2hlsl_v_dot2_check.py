@@ -175,6 +175,8 @@ def run_controls():
           'uint dot2_u32_u16(' in ps_u and 'dot2_i32_i16' not in ps_u)
     check('dot2_i32_i16 emitted on demand and dot2_u32_u16 omitted',
           'uint dot2_i32_i16(' in ps_i and 'dot2_u32_u16' not in ps_i)
+    check('dot2_i32_i16 helper uses strict unsigned carry compares',
+          '((t0 < lo) ? 1 : 0)' in ps_i and '((t1 < lo) ? 1 : 0)' in ps_i)
     zero = [(0, 0, 0)] * 4
     unused_ps = G.Pipeline(vs_words(zero), PRE_WORDS + POST_WORDS, root_blob()).hlsl_ps()
     check('both dot2 helpers omitted when unused', 'dot2_' not in unused_ps)
@@ -249,6 +251,12 @@ DRAW_CASES = (
         (0x80008000, 0x7fff7fff, 0x80000000),  # negative overflow -> saturates to 0x80000000
         (0x80008000, 0x80008000, 0x80000000),  # exact cancellation: 2^31 - 2^31 = 0x00000000 (NO sat!)
         (0x00020003, 0x00040005, 0x3f800000),  # no overflow
+    ]),
+    ('v_dot2_i32_i16', 1, [
+        (0x00000003, 0x00010005, 0x3f800000),  # p1 == 0: no carry, no saturation
+        (0x00030000, 0x00050001, 0xffffffff),  # p0 == 0, c < 0: +14
+        (0x00000000, 0x12345678, 0x7fffffff),  # both products 0, c = INT32_MAX
+        (0x00000000, 0x00000000, 0x80000000),  # both products 0, c = INT32_MIN
     ]),
 )
 
