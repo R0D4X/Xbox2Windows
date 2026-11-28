@@ -664,7 +664,8 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     const bool compared = graphics && i.enc == Encoding::Vopc && i.dst < 106 && i.name.substr(0,6) == "v_cmp_";
     if (mask || compared) {
         const unsigned dst = mask.value_or(i.dst);
-        if ((dst > 105 && dst != 106) || (wave64 && (dst & 1)))
+        const bool numeric_vcc_hi = dst == 107 && direct && !graphics && !wave64;
+        if ((dst > 106 && !numeric_vcc_hi) || (wave64 && (dst & 1)))
             refuse(i.pc, compared ? "unsupported comparison mask destination" : "unsupported carry mask destination");
         const bool tagged = graphics && dst != 106;
         set(dst, tagged ? Symbol{Symbol::Type::lane_mask,i.pc,0} : Symbol{});
@@ -716,6 +717,14 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         // Both the saved/written destination and the updated EXEC are numeric mask words.
         set(i.dst, {});
         set(126, {});
+    } else if (!graphics && i.enc == Encoding::Sop1 && i.name.size() >= 13 &&
+               (i.name.substr(i.name.size() - 13) == "_saveexec_b64" ||
+                i.name.substr(i.name.size() - 11) == "_wrexec_b64")) {
+        // These instructions also overwrite both EXEC words implicitly.
+        set(i.dst, {});
+        set(i.dst + 1, {});
+        set(126, {});
+        set(127, {});
     } else if (i.name == "s_and_b32" || i.name == "s_lshl_b32") {
         const auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
         Symbol out{};
@@ -1776,13 +1785,23 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
             if (inst.enc == Encoding::Lds)
                 refuse(inst.pc, "LDS instruction without allocation");
     if (direct_dxil) {
+        const bool guest_wave32 = stage ? stage->wave32 : request.wave32;
         DirectCompute compiler{emit};
         compiler.wave64 = wave64;
         compiler.heap_view = heap_view;
         compiler.heap_window = heap_window;
         for (size_t i = 0; i < program.code.size(); ++i) {
             const auto& inst = program.code[i];
-            if (!program.reached[i] || inst.enc != Encoding::Mubuf || inst.name != "buffer_store_raw") continue;
+            if (!program.reached[i]) continue;
+            // The narrow wave64 model still requires a guest-aligned carry destination pair.
+            if (!guest_wave32 && carry_destination(inst) == 107)
+                refuse(inst.pc, "unsupported carry mask destination");
+            // s107 is a numeric wave32 mask only for a guest wave32.
+            if (!guest_wave32 && inst.name == "v_cndmask_b32" && inst.src[2] == 107)
+                refuse(inst.pc, "unsupported wave32 conditional mask source");
+            if (!guest_wave32 && inst.name.find("_ci_") != Name::npos && inst.src[2] == 107)
+                refuse(inst.pc, "unsupported carry-in mask source");
+            if (inst.enc != Encoding::Mubuf || inst.name != "buffer_store_raw") continue;
             const auto& symbol = program.before[i].at(((inst.b >> 16) & 31) * 4);
             if (symbol.type == Symbol::Type::descriptor)
                 compiler.read_write_raw_views.emplace(symbol.value, symbol.offset);
